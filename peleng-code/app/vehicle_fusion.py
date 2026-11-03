@@ -32,6 +32,7 @@ from app.vehicle import (
     VehicleTracker,
     anchor_point,
     box_corners,
+    numeric_jacobian,
     predicted_sides,
     robust_update,
     state_from_center,
@@ -85,6 +86,16 @@ class VehicleView:
     heading_rad: float = 0.0
     observed: dict[str, tuple[float, float, float, float]] = field(default_factory=dict)
     rms_px: float | None = None
+    # Неопределённость опорной точки, м: σ по худшему направлению из ковариации фильтра.
+    # Мала — геометрия камер задаёт положение; велика — по одной камере дальность не измерена.
+    sigma_m: float | None = None
+
+
+def anchor_sigma(state: np.ndarray, covariance: np.ndarray, model: VehicleModel) -> float:
+    """σ опорной точки по худшему направлению: J·P·Jᵀ, J — якобиан опорной точки по состоянию."""
+    jacobian = numeric_jacobian(lambda candidate: anchor_point(candidate, model), state)
+    spread = jacobian @ covariance @ jacobian.T
+    return float(np.sqrt(max(float(np.linalg.eigvalsh(0.5 * (spread + spread.T)).max()), 0.0)))
 
 
 @dataclass
@@ -284,6 +295,8 @@ class VehicleFusion:
     def _view(self, fresh: bool, used: dict, rms: float | None) -> VehicleView:
         state = self.tracker.state
         assert state is not None
+        covariance = self.tracker.covariance
+        sigma = None if covariance is None else anchor_sigma(state, covariance, self.model)
         return VehicleView(
             active=True,
             fresh=fresh,
@@ -294,6 +307,7 @@ class VehicleFusion:
             heading_rad=float(state[PSI]),
             observed=used,
             rms_px=rms,
+            sigma_m=sigma,
         )
 
     def _associate(

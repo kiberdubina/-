@@ -1184,6 +1184,7 @@ class App(tk.Tk):
                 f"XYZ {world.xyz[0]:.2f} {world.xyz[1]:.2f} {world.xyz[2]:.2f} м   "
                 f"дальность {np.linalg.norm(world.xyz):.2f} м   "
                 f"{world.speed_m_s:.2f} м/с"
+                + (f"   ±{tick.sigma_m:.1f} м" if getattr(tick, "sigma_m", None) is not None else "")
             )
             focus = self.focus or (tick.steps[0].frame.camera_id if tick.steps else None)
             relative = world.relative.get(focus) if focus else None

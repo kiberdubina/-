@@ -31,6 +31,11 @@ TRAIL_STEP_M = 2.0        # дальше за кадр от прошлой то�
 # Точку в след пишем, когда цель видят хотя бы две камеры: по одной дальность не измерена.
 # Трек и прогноз при этом держатся. Way1: RMSE 6,3 → 3,3 м при покрытии 90 → 73 %.
 TRAIL_MIN_CAMERAS = 2
+# Неопределённость позиции: σ фильтра (VehicleView.sigma_m) занижена — на Way1 ошибка в среднем
+# в ~12 раз больше σ. Калиброванная σ = SIGMA_SCALE·σ; дальше TRAIL_SIGMA_M точка не пишется:
+# геометрия доступных камер не задаёт положение (одна камера: калиброванная σ ≈ 5 м).
+SIGMA_SCALE = 12.0
+TRAIL_SIGMA_M = 4.0
 TRAIL_REJECT_LIMIT = 5    # столько выбросов подряд — это не выброс, а исправление трека
 TRAIL_COAST = 5           # столько кадров без измерения пишется прогноз фильтра
 
@@ -43,6 +48,8 @@ class Tick:
     rays: list[tuple[np.ndarray, np.ndarray]] = field(default_factory=list)
     # Режим машины: 8 углов 3D-ящика в мире (порядок app.vehicle.BOX_EDGES).
     box: np.ndarray | None = None
+    # Калиброванная неопределённость позиции цели, м (режим машины).
+    sigma_m: float | None = None
 
 
 class Session:
@@ -214,11 +221,12 @@ class Session:
         velocity = float(state[V]) * state_axes(state)[0]
         relative = {camera_id: velocity_in_camera(velocity, pose) for camera_id, pose in self.poses.items()}
         world = WorldView(True, anchor, view.speed_m_s, ahead, relative, view.fresh)
-        if self._trail_accept(key, anchor, view.fresh, len(view.observed)):
+        sigma = None if view.sigma_m is None else SIGMA_SCALE * view.sigma_m
+        if self._trail_accept(key, anchor, view.fresh, len(view.observed), sigma):
             self.trail3d.append(anchor.copy())
             if key is not None:
                 self.trail_frames.append((int(key), anchor.copy()))
-        return Tick(steps, world, list(self.trail3d), [], view.corners)
+        return Tick(steps, world, list(self.trail3d), [], view.corners, sigma)
 
     def _trail_reset(self) -> None:
         self._trail_run = 0
@@ -226,13 +234,17 @@ class Session:
         self._trail_rejects = 0
         self._trail_last: tuple[int, np.ndarray] | None = None
 
-    def _trail_accept(self, key, anchor: np.ndarray, fresh: bool, cameras: int) -> bool:
+    def _trail_accept(
+        self, key, anchor: np.ndarray, fresh: bool, cameras: int, sigma_m: float | None = None
+    ) -> bool:
         """Писать ли точку в след: прогрев, короткий пропуск — прогноз, скачок — выброс."""
         self._trail_run += 1
         self._trail_coast = 0 if fresh else self._trail_coast + 1
         if self._trail_run <= TRAIL_WARMUP or self._trail_coast > TRAIL_COAST:
             return False
         if fresh and cameras < TRAIL_MIN_CAMERAS:
+            return False
+        if sigma_m is not None and sigma_m > TRAIL_SIGMA_M:
             return False
         if key is not None and self._trail_last is not None:
             last_key, last_point = self._trail_last
