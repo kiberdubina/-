@@ -1,0 +1,106 @@
+active: motion
+predict_s: 0.5
+board:
+  squares_x: 5
+  squares_y: 7
+  square_m: 0.04
+  marker_m: 0.03
+patterns:
+  green_ball:
+    s_min: 400.0
+    s_max: 90000.0
+    u_min: 15.0
+    u_max: 4000.0
+    r_min: 0.02
+    r_max: 8.0
+    v_min: 0.02
+    v_max: 5.0
+    d_m: null
+    color:
+      h_min: 25
+      h_max: 100
+      s_min: 80
+      v_min: 40
+  aircraft:
+    s_min: 80.0
+    s_max: 8000.0
+    u_min: 5.0
+    u_max: 4000.0
+    r_min: 0.02
+    r_max: 8.0
+    v_min: 0.02
+    v_max: 8.0
+    d_m: null
+    color: null
+    moving_camera: true
+  sky_uav:
+    s_min: 8.0
+    s_max: 1200.0
+    u_min: 0.5
+    u_max: 8000.0
+    r_min: 0.02
+    r_max: 8.0
+    v_min: 0.01
+    v_max: 80.0
+    d_m: null
+    color: null
+    moving_camera: false
+    require_motion: false
+    mode: sky_dark
+  white_drone:
+    s_min: 120.0
+    s_max: 5000.0
+    u_min: 0.5
+    u_max: 6000.0
+    r_min: 0.02
+    r_max: 8.0
+    v_min: 0.01
+    v_max: 8.0
+    d_m: null
+    color: null
+    moving_camera: false
+    require_motion: false
+    mode: white_blob
+  custom:
+    s_min: 200
+    s_max: 20000
+    u_min: 15
+    u_max: 4000
+    r_min: 0.2
+    r_max: 8
+    v_min: 0.05
+    v_max: 5
+    d_m: null
+    color: null
+  motion:
+    s_min: 400.0
+    s_max: 90000.0
+    u_min: 15.0
+    u_max: 4000.0
+    r_min: 0.02
+    r_max: 8.0
+    v_min: 0.02
+    v_max: 5.0
+    d_m: null
+    color: null
+    moving_camera: false
+    require_motion: false
+  black_shirt:
+    s_min: 600
+    s_max: 80000
+    u_min: 8
+    u_max: 4000
+    r_min: 0.02
+    r_max: 8
+    v_min: 0.02
+    v_max: 5
+    d_m: null
+    color:
+      h_min: 0
+      h_max: 180
+      s_min: 0
+      s_max: 100
+      v_min: 0
+      v_max: 55
+    require_motion: true
+    moving_camera: false
