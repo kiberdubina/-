@@ -128,3 +128,25 @@ patterns:
       width_m: 5.13
       height_m: 6.43
       anchor_m: [15.43, -0.11, 3.01]
+  # Цель по описанию (app/object_detector.py, нужен requirements-detect.txt и веса в models/).
+  # s_*/u_*/r_*/v_* можно не задавать: отбор делает модель. Площадь — площадь рамки.
+  black_hoodie_person:
+    mode: object
+    class: person
+    conf: 0.4
+    region: upper
+    color: {h_min: 0, h_max: 180, s_min: 0, s_max: 255, v_min: 0, v_max: 60}
+    color_share: 0.35
+  red_car:
+    mode: object
+    class: car
+    conf: 0.4
+    region: full
+    color:
+      - {h_min: 0, h_max: 10, s_min: 120, s_max: 255, v_min: 70, v_max: 255}
+      - {h_min: 170, h_max: 180, s_min: 120, s_max: 255, v_min: 70, v_max: 255}
+    color_share: 0.25
+  truck_text:
+    mode: text
+    query: ["truck", "cargo truck"]
+    conf: 0.25

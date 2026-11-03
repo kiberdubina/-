@@ -13,3 +13,4 @@ venv/
 reports/*.png
 reports/*.mp4
 !reports/.gitkeep
+*.pt

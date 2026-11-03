@@ -69,10 +69,7 @@ class Session:
         self.backgrounds.clear()
         self._setup_vehicle()
         for pipeline in self.pipelines:
-            pipeline.profile = profile
-            pipeline.detector.profile = profile
-            pipeline.tracker.profile = profile
-            pipeline.tracker.reset()
+            pipeline.set_profile(profile)
 
     def set_sources(self, sources, poses: dict[str, CameraPose] | None = None) -> None:
         self._close()

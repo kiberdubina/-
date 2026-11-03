@@ -1,7 +1,8 @@
 from dataclasses import dataclass
 
-from app.motion import Detection, MotionDetector
-from app.profile import TargetProfile
+from app.motion import Detection
+from app.object_detector import Label, build_detector
+from app.profile import DESCRIBED_MODES, TargetProfile
 from app.source import Frame
 from app.track2d import MultiTrack2D, TrackView
 
@@ -12,32 +13,64 @@ class Step:
     detection: Detection | None
     track: TrackView
     tracks: list[TrackView] | None = None
+    # Цель по описанию: рамки модели с классом или запросом и уверенностью.
+    labels: list[Label] | None = None
 
 
 class Pipeline:
     def __init__(self, profile: TargetProfile, source):
         self.profile = profile
         self.source = source
-        self.detector = MotionDetector(profile)
+        # Детектор по описанию не собрался (нет пакета, весов) — текст для строки статуса.
+        self.detector_error: str | None = None
+        self.detector = self._make_detector()
         self.tracker = MultiTrack2D(profile)
+        self._last: TrackView | None = None
+
+    def _make_detector(self):
+        detector, self.detector_error = build_detector(self.profile, self.profile.detect)
+        return detector
+
+    def set_profile(self, profile: TargetProfile) -> None:
+        described = self.profile.mode in DESCRIBED_MODES or profile.mode in DESCRIBED_MODES
+        self.profile = profile
+        self.tracker.profile = profile
+        self.tracker.reset()
+        self._last = None
+        if described:
+            self.detector = self._make_detector()
+        else:
+            # Фон MOG2 не сбрасывается при смене порогов.
+            self.detector.profile = profile
 
     def set_source(self, source) -> None:
         old = self.source
         self.source = source
         if hasattr(old, "close"):
             old.close()
-        self.detector = MotionDetector(self.profile)
+        self.detector = self._make_detector()
         self.tracker.reset()
+        self._last = None
 
     def step(self) -> Step | None:
         frame = self.source.read()
         if frame is None:
             return None
         if getattr(self.source, "rewound", False):
-            self.detector = MotionDetector(self.profile)
+            self.detector = self._make_detector()
             self.tracker.reset()
+            self._last = None
+        set_hint = getattr(self.detector, "set_hint", None)
+        if set_hint is not None:
+            last = self._last
+            if last is not None and last.active and last.bbox is not None:
+                set_hint((last.cx, last.cy, float(last.bbox[2]), float(last.bbox[3])))
+            else:
+                set_hint(None)
         spots = self.detector.detect(frame.image)
         track = self.tracker.update(spots, frame.time_s)
+        self._last = track
         all_tracks = list(self.tracker.tracks)
         extra = all_tracks if len(all_tracks) > 1 else None
-        return Step(frame, self.tracker.accepted, track, extra)
+        labels = getattr(self.detector, "labels", None)
+        return Step(frame, self.tracker.accepted, track, extra, labels)

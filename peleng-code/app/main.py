@@ -8,7 +8,16 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from app.calib import BoardDetector
-from app.profile import ColorGate, TargetProfile, load_board, load_patterns, load_profile, save_custom
+from app.profile import (
+    ColorGate,
+    TargetProfile,
+    load_board,
+    load_patterns,
+    load_profile,
+    save_active,
+    save_custom,
+    save_pattern,
+)
 from app.rig import Rig
 from app.session import Session
 from app import phone_usb
@@ -195,6 +204,14 @@ class App(tk.Tk):
         target_menu.add_command(label="Зелёный мяч", command=lambda: self.use_pattern("green_ball"))
         target_menu.add_command(label="БПЛА", command=lambda: self.use_pattern("aircraft"))
         target_menu.add_command(label="Своя цель…", command=self.edit_custom)
+        target_menu.add_separator()
+        # Цель по описанию: модель YOLO / YOLO-World (requirements-detect.txt).
+        target_menu.add_command(
+            label="Человек в чёрной кофте", command=lambda: self.use_pattern("black_hoodie_person")
+        )
+        target_menu.add_command(label="Красная машина", command=lambda: self.use_pattern("red_car"))
+        target_menu.add_command(label="Грузовик (текст)", command=lambda: self.use_pattern("truck_text"))
+        target_menu.add_command(label="Своя цель текстом…", command=self.edit_text_query)
         target_menu.add_separator()
         for horizon in (0.25, 0.5, 1.0):
             target_menu.add_command(
@@ -425,7 +442,29 @@ class App(tk.Tk):
         profile.predict_s = self.profile.predict_s
         self.profile = profile
         self.session.set_profile(profile)
-        save_custom(ROOT / "config.yaml", profile, profile.predict_s)
+        # Только выбор: профиль в config.yaml не переписывается и не теряет поля.
+        save_active(ROOT / "config.yaml", name, profile.predict_s)
+
+    def edit_text_query(self) -> None:
+        current = self.patterns.get("text_custom")
+        start = ""
+        if current is not None and current.detect is not None:
+            query = current.detect.get("query") or ""
+            start = query if isinstance(query, str) else ", ".join(query)
+        text = simpledialog.askstring(
+            "Своя цель текстом",
+            "Что искать, например «красная машина» или «person in black hoodie».\n"
+            "Несколько вариантов — через запятую.",
+            initialvalue=start,
+            parent=self,
+        )
+        if not text or not text.strip():
+            return
+        phrases = [part.strip() for part in text.split(",") if part.strip()]
+        fields = {"mode": "text", "query": phrases[0] if len(phrases) == 1 else phrases, "conf": 0.25}
+        save_pattern(ROOT / "config.yaml", "text_custom", fields, self.profile.predict_s)
+        self.patterns = load_patterns(ROOT / "config.yaml")
+        self.use_pattern("text_custom")
 
     def set_horizon(self, value: float) -> None:
         self.profile.predict_s = value
@@ -889,6 +928,18 @@ class App(tk.Tk):
         pose = self.session.poses.get(step.frame.camera_id)
         if box is not None and pose is not None:
             self._draw_box(image, box, pose, step.track.measured)
+        for label in step.labels or []:
+            x, y, w, h = label.detection.bbox
+            cv2.rectangle(image, (x, y), (x + w, y + h), (200, 200, 200), 1)
+            cv2.putText(
+                image,
+                f"{label.name} {label.conf:.2f}",
+                (x, y + h + 16),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (200, 200, 200),
+                1,
+            )
         track = step.track
         if track.bbox is not None:
             x, y, w, h = track.bbox
@@ -1028,6 +1079,9 @@ class App(tk.Tk):
             f"скорость {self.profile.u_min:.0f}–{self.profile.u_max:.0f} px/с   "
             f"прогноз {self.profile.predict_s:.2f} с"
         )
+        detector_note = self._detector_note()
+        if detector_note:
+            parts.append(detector_note)
         for pipeline in self.session.pipelines:
             latency = getattr(pipeline.source, "latency_ms", None)
             if isinstance(latency, (int, float)) and phone_usb.believable_latency_ms(float(latency)):
@@ -1036,6 +1090,26 @@ class App(tk.Tk):
             if note and note not in parts:
                 parts.append(note)
         self.status.configure(text="\n".join(parts))
+
+    def _detector_note(self) -> str | None:
+        """Режим детектора по описанию, устройство и мс; или почему он не включился."""
+        for pipeline in self.session.pipelines:
+            if pipeline.detector_error:
+                return f"детектор {self.profile.mode} не включён: {pipeline.detector_error} — работает движение"
+        timings = [
+            pipeline.detector.ms
+            for pipeline in self.session.pipelines
+            if getattr(pipeline.detector, "spec", None) is not None
+        ]
+        if not timings:
+            return None
+        detector = next(p.detector for p in self.session.pipelines if getattr(p.detector, "spec", None) is not None)
+        spec = detector.spec
+        what = ", ".join(spec.classes) if spec.mode == "object" else ", ".join(spec.query)
+        return (
+            f"детектор {spec.mode}: {what}   {detector.device}   "
+            f"{max(timings):.0f} мс на запуск, раз в {spec.det_every} кадра"
+        )
 
     def destroy(self) -> None:
         for pipeline in self.session.pipelines:
