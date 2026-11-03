@@ -106,9 +106,9 @@ patterns:
     moving_camera: false
   # Дальняя трасса Way1: r_* — дальность от ближайшей камеры, не от нуля мира.
   way1:
-    s_min: 20.0
+    s_min: 40.0
     s_max: 120000.0
-    u_min: 0.5
+    u_min: 1.0
     u_max: 8000.0
     r_min: 1.0
     r_max: 600.0
