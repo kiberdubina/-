@@ -149,7 +149,11 @@ def _reprojection_error(
     return float(np.mean(errors))
 
 
-def triangulate(poses: list[CameraPose], pixels: list[tuple[float, float]]) -> np.ndarray | None:
+def triangulate(
+    poses: list[CameraPose],
+    pixels: list[tuple[float, float]],
+    max_reproj_px: float = 40.0,
+) -> np.ndarray | None:
     """Метры из лучей камер. Два вида считает cv2.triangulatePoints, дальше — лучшая пара."""
     if len(poses) < 2 or len(poses) != len(pixels):
         return None
@@ -171,11 +175,12 @@ def triangulate(poses: list[CameraPose], pixels: list[tuple[float, float]]) -> n
             candidates.append(xyz)
     best = None
     best_error = None
+    limit = float(max_reproj_px)
     for xyz in candidates:
         if any(_depth(pose, xyz) <= 1e-4 for pose in poses):
             continue
         error = _reprojection_error(poses, clean, xyz)
-        if error is None or error > 25.0:
+        if error is None or error > limit:
             continue
         if best_error is None or error < best_error:
             best = xyz

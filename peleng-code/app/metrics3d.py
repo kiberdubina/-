@@ -44,6 +44,19 @@ def _as_track(array: np.ndarray) -> np.ndarray:
     return data
 
 
+def _stats_from_diff(diff: np.ndarray) -> dict:
+    err = np.linalg.norm(diff, axis=1)
+    return {
+        "rmse_m": float(np.sqrt(np.mean(err**2))),
+        "median_m": float(np.median(err)),
+        "max_m": float(np.max(err)),
+        "rmse_x": float(np.sqrt(np.mean(diff[:, 0] ** 2))),
+        "rmse_y": float(np.sqrt(np.mean(diff[:, 1] ** 2))),
+        "rmse_z": float(np.sqrt(np.mean(diff[:, 2] ** 2))),
+        "hit_ratio": float(np.mean(err <= HIT_THRESHOLD_M)),
+    }
+
+
 def compare_tracks(est: np.ndarray, truth: np.ndarray) -> dict:
     """Сравнение по min(len): построчная евклидова ошибка."""
     est = _as_track(est)
@@ -59,17 +72,28 @@ def compare_tracks(est: np.ndarray, truth: np.ndarray) -> dict:
             "rmse_z": float("nan"),
             "hit_ratio": 0.0,
         }
-    diff = est[:n] - truth[:n]
-    err = np.linalg.norm(diff, axis=1)
-    return {
-        "rmse_m": float(np.sqrt(np.mean(err**2))),
-        "median_m": float(np.median(err)),
-        "max_m": float(np.max(err)),
-        "rmse_x": float(np.sqrt(np.mean(diff[:, 0] ** 2))),
-        "rmse_y": float(np.sqrt(np.mean(diff[:, 1] ** 2))),
-        "rmse_z": float(np.sqrt(np.mean(diff[:, 2] ** 2))),
-        "hit_ratio": float(np.mean(err <= HIT_THRESHOLD_M)),
-    }
+    return _stats_from_diff(est[:n] - truth[:n])
+
+
+def compare_tracks_nearest(est: np.ndarray, truth: np.ndarray) -> dict:
+    """Каждая оценка к ближайшей точке эталона. Для редкого следа на длинной трассе."""
+    est = _as_track(est)
+    truth = _as_track(truth)
+    if est.shape[0] == 0 or truth.shape[0] == 0:
+        return {
+            "rmse_m": float("nan"),
+            "median_m": float("nan"),
+            "max_m": float("nan"),
+            "rmse_x": float("nan"),
+            "rmse_y": float("nan"),
+            "rmse_z": float("nan"),
+            "hit_ratio": 0.0,
+        }
+    diff = np.empty_like(est)
+    for index, point in enumerate(est):
+        nearest = int(np.argmin(np.linalg.norm(truth - point.reshape(1, 3), axis=1)))
+        diff[index] = point - truth[nearest]
+    return _stats_from_diff(diff)
 
 
 def compare_by_frame(

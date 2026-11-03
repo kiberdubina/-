@@ -250,7 +250,13 @@ class Session:
             pixels.append((step.detection.cx, step.detection.cy))
             times.append(step.frame.time_s)
         span = max(times) - min(times) if times else 0.0
-        xyz = triangulate(poses, pixels) if len(poses) >= 2 and span <= PAIR_SYNC_S else None
+        # Дальняя трасса: центры 2D шумнее, допуск репроекции шире.
+        reproj = 60.0 if self.profile.v_max > 20.0 else 40.0
+        xyz = (
+            triangulate(poses, pixels, max_reproj_px=reproj)
+            if len(poses) >= 2 and span <= PAIR_SYNC_S
+            else None
+        )
         if xyz is not None:
             distance = range_from_cameras(xyz, poses)
             if not (self.profile.r_min <= distance <= self.profile.r_max):

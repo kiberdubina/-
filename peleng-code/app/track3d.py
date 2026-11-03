@@ -26,10 +26,12 @@ class Track3D:
         self.kf.measurementMatrix = np.hstack(
             [np.eye(3, dtype=np.float32), np.zeros((3, 3), np.float32)]
         )
+        # На дальней трассе измерения шумнее — доверяем им меньше, чем на столе.
+        meas = 0.002 if self.profile.v_max <= 20.0 else 2.0
         self.kf.processNoiseCov = np.diag([1e-4, 1e-4, 1e-4, 0.05, 0.05, 0.05]).astype(
             np.float32
         )
-        self.kf.measurementNoiseCov = np.eye(3, dtype=np.float32) * 0.002
+        self.kf.measurementNoiseCov = np.eye(3, dtype=np.float32) * float(meas)
         self.kf.errorCovPost = np.eye(6, dtype=np.float32)
         self.ready = False
         self.miss = 0
@@ -86,8 +88,12 @@ class Track3D:
     ) -> bool:
         predicted = self.kf.statePre[:3, 0]
         jump = float(np.linalg.norm(xyz - predicted))
-        # Нижняя планка скачка растёт с v_max: на столе ~0,15 м, на трассе — доля шага.
-        jump_cap = max(0.15, 0.35 * self.profile.v_max * dt, self.profile.v_max * dt)
+        # После пропуска ворота шире: прогноз уехал, шум триангуляции на дальних камерах больше.
+        jump_cap = max(
+            0.15,
+            self.profile.v_max * dt * (1.0 + float(self.miss)),
+            0.05 * self.profile.v_max,
+        )
         if jump > jump_cap:
             return False
         distance = range_from_cameras(xyz, poses or {})
