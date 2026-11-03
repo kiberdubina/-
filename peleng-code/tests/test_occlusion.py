@@ -112,5 +112,33 @@ class TotalLossTest(unittest.TestCase):
         self.assertEqual(len(fusion.segments), 1)
 
 
+class SingleCameraTest(unittest.TestCase):
+    def test_one_camera_does_not_teach_speed(self):
+        # С кадра 40 цель видит только cam-1, и силуэт обрезан деревом: по такому измерению
+        # дальность не задана. С hold_motion_single скорость остаётся прежней.
+        def scene(frame, state, pose):
+            if frame < 40:
+                return silhouette(state, pose)
+            return silhouette(state, pose, 0.6) if pose.camera_id == "cam-1" else []
+
+        def speeds(hold: bool) -> list[float]:
+            fusion = VehicleFusion(
+                MODEL, FusionConfig(init_min_area_px=50.0, range_m=(1.0, 500.0), hold_motion_single=hold)
+            )
+            state = START.copy()
+            out = []
+            for frame in range(70):
+                cameras = {pose.camera_id: CameraView(pose, scene(frame, state, pose)) for pose in FIVE}
+                view = fusion.step(frame * DT, cameras, key=frame)
+                if frame >= 45:
+                    self.assertEqual(sorted(view.observed), ["cam-1"])
+                    out.append(view.speed_m_s)
+                state = ctrv_step(state, DT, yaw_tau_s=0.0)
+            return out
+
+        held = speeds(True)
+        self.assertLess(max(abs(speed - START[5]) for speed in held), 0.3)
+
+
 if __name__ == "__main__":
     unittest.main()
