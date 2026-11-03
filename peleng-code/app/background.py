@@ -46,6 +46,10 @@ class BackgroundConfig:
     ghost_still: float = 6.0       # изменение пикселя, при котором он ещё «неподвижен»
     warmup_frames: int = 3         # первые кадры только учат фон
     exposure: bool = True          # выравнивать экспозицию кадра и фона
+    # Поворотная камера: поза на кадре известна с ошибкой в пару пикселей, и на каждом
+    # контрастном крае кадр и панорама расходятся. Пиксель, который объясняется фоном
+    # со сдвигом до shift_px (рабочие px), — не передний план.
+    shift_px: int = 1
 
 
 @dataclass
@@ -349,6 +353,7 @@ class RotatingBackground:
             foreground = np.zeros(work.shape[:2], bool)
         else:
             foreground = classify(work, mean, var, valid, self.config)
+            foreground &= ~_shift_explained(work, mean, self.config)
 
         window = grid.window(col, row)
         if window is not None:
@@ -496,6 +501,16 @@ class RecordingBackground:
         work = cv2.resize(image, self.size, interpolation=cv2.INTER_AREA).astype(np.float32)
         mean, valid = self.background_for(pose)
         return classify(work, mean, self.config.init_sigma**2, valid, self.config)
+
+
+def _shift_explained(image: np.ndarray, mean: np.ndarray, config: BackgroundConfig) -> np.ndarray:
+    """Пиксель лежит в диапазоне фона окрестности ±shift_px (с запасом min_diff) по всем каналам."""
+    if config.shift_px <= 0:
+        return np.zeros(image.shape[:2], bool)
+    kernel = np.ones((2 * config.shift_px + 1, 2 * config.shift_px + 1), np.uint8)
+    low = cv2.erode(mean, kernel) - config.min_diff
+    high = cv2.dilate(mean, kernel) + config.min_diff
+    return np.all((image >= low) & (image <= high), axis=2)
 
 
 def _work_mask(hold: np.ndarray | None, size: tuple[int, int]) -> np.ndarray:
