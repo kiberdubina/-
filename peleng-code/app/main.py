@@ -184,6 +184,7 @@ class App(tk.Tk):
         file_menu.add_command(label="URL потока…", command=self.open_url)
         file_menu.add_command(label="Сохранить контроль…", command=self.save_control)
         file_menu.add_command(label="Отчёт погрешности…", command=self.save_metrics)
+        file_menu.add_command(label="Контрольный прогон Way1…", command=self.run_way1_control)
         file_menu.add_separator()
         file_menu.add_command(label="Выход", command=self.destroy)
         menu.add_cascade(label="Файл", menu=file_menu)
@@ -234,28 +235,93 @@ class App(tk.Tk):
         messagebox.showinfo("Сохранить контроль", "\n".join(parts))
 
     def save_metrics(self) -> None:
-        """Сравнить след сессии с таблицей цели (эталон локально, не в git)."""
-        from app.metrics3d import compare_tracks, load_truth_meters, write_metrics_report
+        """Сравнить след сессии с таблицей цели по номерам кадров (эталон локально, не в git)."""
+        from app.metrics3d import compare_by_frame, load_truth_meters, write_metrics_report
 
-        if not self.session.trail3d:
-            messagebox.showwarning("Погрешность", "След 3D пуст. Сначала нужен прогон с XYZ.")
+        marked = list(self.session.trail_frames)
+        if not marked:
+            messagebox.showwarning(
+                "Погрешность", "Нет точек 3D с номером кадра. Сначала прогон записи с XYZ."
+            )
             return
         try:
             truth = load_truth_meters(ROOT)
         except Exception as error:
             messagebox.showerror("Погрешность", f"Эталон не прочитан: {error}")
             return
-        est = np.stack([np.asarray(p, np.float64).reshape(3) for p in self.session.trail3d])
-        stats = compare_tracks(est, truth)
+        frames = [frame for frame, _ in marked]
+        est = np.stack([np.asarray(point, np.float64).reshape(3) for _, point in marked])
+        stats = compare_by_frame(frames, est, truth)
         out = ROOT / "reports" / "metrics.txt"
         out.parent.mkdir(parents=True, exist_ok=True)
         write_metrics_report(stats, out)
         messagebox.showinfo(
             "Погрешность",
+            f"Кадров: {stats['frames']} ({100 * stats['coverage']:.1f}% записи)\n"
             f"RMSE {stats.get('rmse_m', float('nan')):.3f} м\n"
             f"медиана {stats.get('median_m', float('nan')):.3f} м\n"
             f"файл {out.name}",
         )
+
+    def run_way1_control(self) -> None:
+        """Контрольный прогон записи Way1 целиком в фоне: трек, 3D-ящик, графики, видео."""
+        if getattr(self, "_control_thread", None) is not None and self._control_thread.is_alive():
+            messagebox.showinfo("Контрольный прогон", "Прогон уже идёт.")
+            return
+        from app.cine_table import track_meters
+        from app.control_run import ControlConfig, run_control, way1_clips
+        from app.vehicle import VehicleModel
+
+        pattern = self.patterns.get("way1")
+        if pattern is None or not pattern.vehicle:
+            messagebox.showerror("Контрольный прогон", "В config.yaml у профиля way1 нет блока vehicle.")
+            return
+        try:
+            clips = way1_clips(ROOT)
+            truth = track_meters(ROOT)
+        except Exception as error:
+            messagebox.showerror("Контрольный прогон", f"Нет данных Way1: {error}")
+            return
+        out_dir = ROOT / "reports" / "way1_control"
+        model = VehicleModel.from_config(pattern.vehicle)
+        config = ControlConfig()
+        config.fusion.range_m = (pattern.r_min, pattern.r_max)
+        self._control_note = "Контрольный прогон: старт…"
+        self._control_result = None
+
+        def progress(stage: str, share: float) -> None:
+            self._control_note = f"Контрольный прогон: {stage} {100 * share:.0f}%"
+
+        def work() -> None:
+            try:
+                self._control_result = run_control(clips, model, out_dir, truth, config, progress)
+            except Exception as error:  # отчёт в окно, поток не роняет программу
+                self._control_result = error
+
+        self._control_thread = threading.Thread(target=work, daemon=True)
+        self._control_thread.start()
+        self.after(500, self._watch_control)
+
+    def _watch_control(self) -> None:
+        thread = getattr(self, "_control_thread", None)
+        if thread is not None and thread.is_alive():
+            self._phone_wait_text = self._control_note
+            self.after(500, self._watch_control)
+            return
+        self._phone_wait_text = ""
+        result = self._control_result
+        if isinstance(result, Exception):
+            messagebox.showerror("Контрольный прогон", str(result))
+            return
+        lines = [f"Папка: {ROOT / 'reports' / 'way1_control'}"]
+        if result is not None and result.stats:
+            stats = result.stats
+            lines += [
+                f"Кадров с оценкой: {stats['frames']} ({100 * stats['coverage']:.1f}%)",
+                f"RMSE {stats['rmse_m']:.3f} м, медиана {stats['median_m']:.3f} м",
+                f"95% кадров точнее {stats['p95_m']:.3f} м, максимум {stats['max_m']:.3f} м",
+            ]
+        messagebox.showinfo("Контрольный прогон", "\n".join(lines))
 
     def open_phone(self) -> None:
         self._dismissed_phones.clear()
@@ -798,7 +864,7 @@ class App(tk.Tk):
         }
         tiles: list[tuple[str, np.ndarray]] = []
         for step in visible:
-            image = self._annotate(step)
+            image = self._annotate(step, getattr(tick, "box", None))
             image = self._zoom_frame(step.frame.camera_id, image, step.track)
             self._last_tiles[step.frame.camera_id] = image
             tiles.append((step.frame.camera_id, image))
@@ -818,8 +884,11 @@ class App(tk.Tk):
         self._draw_scene(tick)
         self._draw_status(tick)
 
-    def _annotate(self, step) -> np.ndarray:
+    def _annotate(self, step, box: np.ndarray | None = None) -> np.ndarray:
         image = step.frame.image.copy()
+        pose = self.session.poses.get(step.frame.camera_id)
+        if box is not None and pose is not None:
+            self._draw_box(image, box, pose, step.track.measured)
         track = step.track
         if track.bbox is not None:
             x, y, w, h = track.bbox
@@ -851,6 +920,21 @@ class App(tk.Tk):
             cv2.circle(image, origin, 4, (255, 255, 255), -1)
             cv2.circle(image, ahead, 4, (255, 0, 255), -1)
         return image
+
+    @staticmethod
+    def _draw_box(image: np.ndarray, box: np.ndarray, pose, measured: bool) -> None:
+        """Каркас 3D-ящика цели в кадре камеры: зелёный — камера дала измерение."""
+        from app.vehicle import BOX_EDGES, project_points
+
+        pixels, depth = project_points(pose, np.asarray(box, np.float64))
+        if float(depth.min()) <= 0.5 or not np.isfinite(pixels).all() or np.abs(pixels).max() > 1e5:
+            return
+        color = (60, 220, 60) if measured else (0, 200, 255)
+        thickness = max(2, int(round(image.shape[1] / 640)))
+        for a, b in BOX_EDGES:
+            start = tuple(int(round(v)) for v in pixels[a])
+            end = tuple(int(round(v)) for v in pixels[b])
+            cv2.line(image, start, end, color, thickness, cv2.LINE_AA)
 
     def _zoom_frame(self, camera_id: str, image: np.ndarray, track) -> np.ndarray:
         """Crop the annotated frame only. Detection still sees the full image."""
@@ -910,6 +994,7 @@ class App(tk.Tk):
             list(self.session.poses.values()),
             hint,
             tick.rays,
+            getattr(tick, "box", None),
         )
 
     def _draw_status(self, tick) -> None:

@@ -10,6 +10,8 @@ class Frame:
     image: np.ndarray
     time_s: float
     camera_id: str
+    # Номер кадра в записи (0…). У живого потока — None: сверять с таблицей нечего.
+    index: int | None = None
 
 
 class SyntheticSource:
@@ -65,9 +67,10 @@ class VideoSource:
                 ok, image = self.capture.read()
             if not ok or image is None:
                 return None
-        t = self.index / self.fps
+        number = self.index
+        t = number / self.fps
         self.index += 1
-        return Frame(image, t, self.camera_id)
+        return Frame(image, t, self.camera_id, number)
 
     def close(self) -> None:
         self.capture.release()

@@ -40,6 +40,9 @@ class TargetProfile:
     require_motion: bool = False
     # motion | ego(via moving_camera) | color | sky_dark | white_blob
     mode: str = "auto"
+    # Наземная машина: габарит 3D-ящика и опорная точка (см. app.vehicle.VehicleModel).
+    # Есть — 3D считается подгонкой ящика к рамкам камер, нет — триангуляцией точки.
+    vehicle: dict | None = None
 
     @property
     def horizon_s(self) -> float:
@@ -77,6 +80,7 @@ def _profile(name: str, target: dict, predict_s: float) -> TargetProfile:
         moving_camera=bool(target.get("moving_camera", False)),
         require_motion=bool(target.get("require_motion", False)),
         mode=str(target.get("mode", "auto")),
+        vehicle=dict(target["vehicle"]) if target.get("vehicle") else None,
     )
 
 

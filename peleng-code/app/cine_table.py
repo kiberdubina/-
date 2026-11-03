@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 
 from app.geom import CameraPose
+from app.way1_files import find_file
 
 # Разбор CSV один раз на процесс: pose_at не открывает файл заново.
 _CACHE: dict[tuple[str, str], object] = {}
@@ -81,7 +82,7 @@ def _cached(root: Path, name: str, loader):
     key = (str(Path(root).resolve()), name)
     hit = _CACHE.get(key)
     if hit is None:
-        hit = loader(Path(root) / name)
+        hit = loader(find_file(root, name))
         _CACHE[key] = hit
     return hit
 

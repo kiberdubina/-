@@ -118,3 +118,13 @@ patterns:
     color: null
     moving_camera: false
     require_motion: false
+    # Цель — фура (SM_AA_track). Ящик относительно задней оси на земле:
+    # вперёд, влево, вверх, метры. anchor_m — опорная точка (pivot) 3D-модели,
+    # её координаты даёт таблица object_transform_SM_AA_track. Габарит и pivot
+    # определены подгонкой ящика к силуэтам камер 1–4 (см. docs/защита.md).
+    vehicle:
+      front_m: 14.12
+      rear_m: -5.54
+      width_m: 5.13
+      height_m: 6.43
+      anchor_m: [15.43, -0.11, 3.01]

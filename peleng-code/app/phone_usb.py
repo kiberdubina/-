@@ -9,6 +9,7 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -34,7 +35,9 @@ _SESSION = 1 << 63
 _CONFIG = 1 << 62
 _KEY = 1 << 61
 _PTS_MASK = _KEY - 1
-_NO_WINDOW = 0x08000000
+# CREATE_NO_WINDOW: консоль adb не всплывает. Флаг есть только в Windows,
+# в macOS и Linux subprocess отвергает любой ненулевой creationflags.
+_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 _TARGET_MS = 50
 # Выше этого — часы телефона против ноутбука (сон, uptime), не стекло-стекло.
 MAX_LATENCY_MS = 400

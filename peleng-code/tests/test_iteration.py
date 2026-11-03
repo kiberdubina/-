@@ -79,6 +79,7 @@ class IterationTest(unittest.TestCase):
         ]
         self.assertLess(max(jumps), 140)
 
+    @unittest.skipUnless(VIDEO.is_file(), f"нет ролика {VIDEO.name} (видео в git не хранятся)")
     def test_ball_video_follows_green_without_a_spike(self):
         profile = load_profile(ROOT / "config.yaml")
         pipeline = Pipeline(profile, VideoSource(str(VIDEO), "file"))
@@ -189,6 +190,7 @@ class IterationTest(unittest.TestCase):
         self.assertIsNotNone(pose)
         self.assertLess(float(np.linalg.norm(pose.tvec.ravel() - tvec.ravel())), 0.02)
 
+    @unittest.skipUnless((ROOT / "IMG_0985.MOV").is_file(), "нет ролика IMG_0985.MOV (видео в git не хранятся)")
     def test_moving_camera_keeps_one_small_target(self):
         profile = load_patterns(ROOT / "config.yaml")["aircraft"]
         pipeline = Pipeline(profile, VideoSource(str(ROOT / "IMG_0985.MOV"), "file"))
