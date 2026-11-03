@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from app.motion import Detection, MotionDetector
 from app.profile import TargetProfile
 from app.source import Frame
-from app.track2d import Track2D, TrackView
+from app.track2d import MultiTrack2D, TrackView
 
 
 @dataclass
@@ -11,6 +11,7 @@ class Step:
     frame: Frame
     detection: Detection | None
     track: TrackView
+    tracks: list[TrackView] | None = None
 
 
 class Pipeline:
@@ -18,7 +19,7 @@ class Pipeline:
         self.profile = profile
         self.source = source
         self.detector = MotionDetector(profile)
-        self.tracker = Track2D(profile)
+        self.tracker = MultiTrack2D(profile)
 
     def set_source(self, source) -> None:
         old = self.source
@@ -37,4 +38,6 @@ class Pipeline:
             self.tracker.reset()
         spots = self.detector.detect(frame.image)
         track = self.tracker.update(spots, frame.time_s)
-        return Step(frame, self.tracker.accepted, track)
+        all_tracks = list(self.tracker.tracks)
+        extra = all_tracks if len(all_tracks) > 1 else None
+        return Step(frame, self.tracker.accepted, track, extra)

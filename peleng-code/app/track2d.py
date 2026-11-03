@@ -203,11 +203,7 @@ class Track2D:
         return abs(math.log(area / mid))
 
     def _as_spots(self, spots: list[Detection] | Detection | None) -> list[Detection]:
-        if spots is None:
-            return []
-        if isinstance(spots, Detection):
-            return [spots]
-        return list(spots)
+        return _as_spots(spots)
 
     def _pick_initial(self, spots: list[Detection]) -> Detection | None:
         if not spots:
@@ -313,3 +309,155 @@ class Track2D:
             tuple(self.points),
             horizon,
         )
+
+
+def _as_spots(spots: list[Detection] | Detection | None) -> list[Detection]:
+    if spots is None:
+        return []
+    if isinstance(spots, Detection):
+        return [spots]
+    return list(spots)
+
+
+# Сколько одновременных 2D-треков держим на кадре.
+MAX_TRACKS_2D = 8
+# Новый трек только если пятно не слишком далеко от уже ведущихся целей.
+SPAWN_NEAR_TRACK_PX = 420.0
+
+
+class MultiTrack2D:
+    """Несколько Track2D: пятна раздаются по очереди, ворота не дают перехватить чужим."""
+
+    def __init__(self, profile: TargetProfile):
+        self._profile = profile
+        self._tracks: list[Track2D] = []
+        self._last_views: list[TrackView] = []
+
+    @property
+    def profile(self) -> TargetProfile:
+        return self._profile
+
+    @profile.setter
+    def profile(self, value: TargetProfile) -> None:
+        self._profile = value
+        for track in self._tracks:
+            track.profile = value
+
+    @property
+    def horizon_s(self) -> float:
+        return float(self._profile.predict_s)
+
+    @horizon_s.setter
+    def horizon_s(self, value: float) -> None:
+        self._profile.predict_s = float(value)
+
+    @property
+    def accepted(self) -> Detection | None:
+        primary = self._primary_track()
+        return None if primary is None else primary.accepted
+
+    def reset(self) -> None:
+        self._tracks.clear()
+        self._last_views.clear()
+
+    def update(self, spots: list[Detection] | Detection | None, time_s: float) -> TrackView:
+        views = self._update_all(spots, time_s)
+        return views[0] if views else self._idle_view()
+
+    @property
+    def tracks(self) -> tuple[TrackView, ...]:
+        return tuple(self._last_views)
+
+    def _idle_view(self) -> TrackView:
+        return TrackView(
+            False,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            "поиск",
+            False,
+            False,
+            0.0,
+            0.0,
+            None,
+            None,
+            None,
+            (),
+            self.horizon_s,
+        )
+
+    def _primary_track(self) -> Track2D | None:
+        for track in self._tracks:
+            if track.ready:
+                return track
+        return None
+
+    def _update_all(
+        self, spots: list[Detection] | Detection | None, time_s: float
+    ) -> list[TrackView]:
+        remaining = _as_spots(spots)
+        self._last_views = []
+
+        if not self._tracks:
+            starter = Track2D(self._profile)
+            view = starter.update(remaining, time_s)
+            if starter.ready:
+                self._tracks.append(starter)
+                self._last_views.append(view)
+                self._drop_spot(remaining, starter.accepted)
+            self._spawn_secondary(remaining, time_s)
+            return self._finish_views()
+
+        # Главный трек (индекс 0) первым забирает ближайшее пятно в воротах.
+        order = list(range(len(self._tracks)))
+        order.sort(key=lambda index: (0 if index == 0 else 1, index))
+        kept: list[tuple[int, Track2D, TrackView]] = []
+        for index in order:
+            track = self._tracks[index]
+            view = track.update(remaining, time_s)
+            if track.ready:
+                kept.append((index, track, view))
+            self._drop_spot(remaining, track.accepted)
+
+        kept.sort(key=lambda item: item[0])
+        self._tracks = [track for _, track, _ in kept]
+        self._last_views = [view for _, _, view in kept]
+        self._spawn_secondary(remaining, time_s)
+        return self._finish_views()
+
+    @staticmethod
+    def _drop_spot(remaining: list[Detection], spot: Detection | None) -> None:
+        if spot is not None and spot in remaining:
+            remaining.remove(spot)
+
+    def _spawn_secondary(self, remaining: list[Detection], time_s: float) -> None:
+        for spot in list(remaining):
+            if len(self._tracks) >= MAX_TRACKS_2D:
+                break
+            if not self._should_spawn(spot):
+                continue
+            track = Track2D(self._profile)
+            view = track.update([spot], time_s)
+            if not track.ready:
+                continue
+            self._tracks.append(track)
+            self._last_views.append(view)
+            self._drop_spot(remaining, spot)
+
+    def _should_spawn(self, spot: Detection) -> bool:
+        ready = [track for track in self._tracks if track.ready]
+        if not ready:
+            return True
+        nearest = min(
+            math.hypot(spot.cx - track.last_cx, spot.cy - track.last_cy) for track in ready
+        )
+        return nearest <= SPAWN_NEAR_TRACK_PX
+
+    def _finish_views(self) -> list[TrackView]:
+        if not self._last_views:
+            idle = self._idle_view()
+            self._last_views = [idle]
+            return [idle]
+        return list(self._last_views)
