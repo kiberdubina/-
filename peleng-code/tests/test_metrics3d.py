@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT))
 from app.metrics3d import (
     HIT_THRESHOLD_M,
     compare_tracks,
+    compare_tracks_nearest,
     load_truth_meters,
     write_metrics_report,
 )
@@ -58,6 +59,14 @@ class Metrics3DTest(unittest.TestCase):
         track = load_truth_meters(ROOT)
         self.assertEqual(track.shape, (1002, 3))
         self.assertTrue(np.isfinite(track).all())
+
+    def test_nearest_match_ignores_prefix_alignment(self):
+        truth = np.array([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [20.0, 0.0, 0.0]], np.float64)
+        est = np.array([[20.1, 0.0, 0.0]], np.float64)
+        naive = compare_tracks(est, truth)
+        nearest = compare_tracks_nearest(est, truth)
+        self.assertGreater(naive["rmse_m"], 15.0)
+        self.assertLess(nearest["rmse_m"], 1.0)
 
 
 if __name__ == "__main__":

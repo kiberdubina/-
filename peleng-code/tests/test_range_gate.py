@@ -44,6 +44,18 @@ class RangeGateTest(unittest.TestCase):
         self.assertTrue(view.active)
         self.assertTrue(view.fresh)
 
+    def test_way1_accepts_after_short_gap_with_jump(self):
+        profile = load_patterns(ROOT / "config.yaml")["way1"]
+        track = Track3D(profile)
+        poses = {}
+        p0 = np.array([-200.0, 110.0, 5.0])
+        self.assertTrue(track.update(p0, 0.0, poses).fresh)
+        # Один кадр без измерения.
+        track.update(None, 0.033, poses)
+        p1 = p0 + np.array([6.0, 1.0, 0.0])
+        view = track.update(p1, 0.066, poses)
+        self.assertTrue(view.fresh)
+
 
 if __name__ == "__main__":
     unittest.main()

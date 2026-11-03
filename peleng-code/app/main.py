@@ -235,7 +235,11 @@ class App(tk.Tk):
 
     def save_metrics(self) -> None:
         """Сравнить след сессии с таблицей цели (эталон локально, не в git)."""
-        from app.metrics3d import compare_tracks, load_truth_meters, write_metrics_report
+        from app.metrics3d import (
+            compare_tracks_nearest,
+            load_truth_meters,
+            write_metrics_report,
+        )
 
         if not self.session.trail3d:
             messagebox.showwarning("Погрешность", "След 3D пуст. Сначала нужен прогон с XYZ.")
@@ -246,7 +250,8 @@ class App(tk.Tk):
             messagebox.showerror("Погрешность", f"Эталон не прочитан: {error}")
             return
         est = np.stack([np.asarray(p, np.float64).reshape(3) for p in self.session.trail3d])
-        stats = compare_tracks(est, truth)
+        # Редкий след на длинной трассе: к ближайшей точке эталона, не к префиксу CSV.
+        stats = compare_tracks_nearest(est, truth)
         out = ROOT / "reports" / "metrics.txt"
         out.parent.mkdir(parents=True, exist_ok=True)
         write_metrics_report(stats, out)
