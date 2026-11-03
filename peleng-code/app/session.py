@@ -21,7 +21,8 @@ from app.vehicle_fusion import CameraView, FusionConfig, VehicleFusion
 PAIR_SYNC_S = 0.08
 MAX_TRACKS3D = 4
 # Живой режим машины: фон считается на кадре этой ширины (быстрее, чем в контрольном прогоне).
-LIVE_WORK_WIDTH = 480
+# Ширина кадра живого фона. Way1: 480 — RMSE 8,1 м, 640 — 6,3 м при 1,6× времени, 960 не лучше.
+LIVE_WORK_WIDTH = 640
 # Запас вокруг проекции прогнозного ящика, где живой фон не учится, px полного кадра.
 HOLD_PAD_PX = 30
 
