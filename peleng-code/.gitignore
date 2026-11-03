@@ -1,0 +1,15 @@
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.csv
+__pycache__/
+*.pyc
+_eval_previews/
+.DS_Store
+*.egg-info/
+.venv/
+venv/
+reports/*.png
+reports/*.mp4
+!reports/.gitkeep
