@@ -1,10 +1,11 @@
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 
 from app.calib import BoardDetector, intrinsics_from_views, pose_from_view
-from app.geom import CameraPose, sight_rays, triangulate
+from app.geom import CameraPose, range_from_cameras, sight_rays, triangulate
 from app.pipeline import Pipeline, Step
 from app.profile import TargetProfile
 from app.rig import Rig, RigCamera
@@ -12,6 +13,7 @@ from app.track3d import Track3D, WorldView
 
 # Два кадра дальше этого зазора — разные положения цели. Такую пару не триангулируем.
 PAIR_SYNC_S = 0.08
+MAX_TRACKS3D = 4
 
 
 @dataclass
@@ -28,14 +30,18 @@ class Session:
         self.pipelines: list[Pipeline] = []
         self.poses: dict[str, CameraPose] = {}
         self.samples: dict[str, list] = {}
-        self.track3d = Track3D(profile)
-        self.trail3d: deque[np.ndarray] = deque(maxlen=600)
+        self.pose_root: Path | None = None
+        self.moving_pose_ids: set[str] = {"cam-5"}
+        self.tracks3d: list[Track3D] = [Track3D(profile)]
+        self.track3d = self.tracks3d[0]
+        self.trail3d: deque[np.ndarray] = deque(maxlen=4000)
         self.target_id = 1
         self.set_sources([source])
 
     def set_profile(self, profile: TargetProfile) -> None:
         self.profile = profile
-        self.track3d = Track3D(profile)
+        self.tracks3d = [Track3D(profile)]
+        self.track3d = self.tracks3d[0]
         self.trail3d.clear()
         for pipeline in self.pipelines:
             pipeline.profile = profile
@@ -48,8 +54,14 @@ class Session:
         self.pipelines = [Pipeline(self.profile, source) for source in sources]
         self.poses = dict(poses or {})
         self.samples.clear()
-        self.track3d.reset()
+        self.pose_root = None
+        self.tracks3d = [Track3D(self.profile)]
+        self.track3d = self.tracks3d[0]
         self.trail3d.clear()
+
+    def set_pose_source(self, root: Path | None) -> None:
+        """Корень Way1 с CSV поз. После set_sources вызовите из use_way1(ROOT)."""
+        self.pose_root = None if root is None else Path(root)
 
     def set_rig(self, rig: Rig) -> None:
         sources = [
@@ -75,6 +87,7 @@ class Session:
         for pipeline in self.pipelines:
             step = pipeline.step()
             if step is not None:
+                self._refresh_moving_pose(pipeline, step)
                 steps.append(step)
         if not steps:
             return None
@@ -105,6 +118,19 @@ class Session:
             solved.append(camera_id)
         return solved
 
+    def _refresh_moving_pose(self, pipeline: Pipeline, step: Step) -> None:
+        camera_id = step.frame.camera_id
+        if self.pose_root is None or camera_id not in self.moving_pose_ids:
+            return
+        from app.cine_table import pose_at
+
+        source = pipeline.source
+        frame = max(0, int(getattr(source, "index", 1)) - 1)
+        height, width = step.frame.image.shape[:2]
+        self.poses[camera_id] = pose_at(
+            self.pose_root, camera_id, frame, int(width), int(height)
+        )
+
     def _fuse(self, steps: list[Step]) -> tuple[WorldView, list[tuple[np.ndarray, np.ndarray]]]:
         poses = []
         pixels = []
@@ -121,12 +147,72 @@ class Session:
         span = max(times) - min(times) if times else 0.0
         xyz = triangulate(poses, pixels) if len(poses) >= 2 and span <= PAIR_SYNC_S else None
         if xyz is not None:
-            distance = float(np.linalg.norm(xyz))
+            distance = range_from_cameras(xyz, poses)
             if not (self.profile.r_min <= distance <= self.profile.r_max):
                 xyz = None
         rays = [] if xyz is None else sight_rays(poses, xyz)
         time_s = max(step.frame.time_s for step in steps)
-        return self.track3d.update(xyz, time_s, self.poses), rays
+        return self._update_tracks3d(xyz, time_s, self.poses), rays
+
+    def _jump_cap(self, dt: float) -> float:
+        p = self.profile
+        return max(0.15, 0.35 * p.v_max * dt, p.v_max * dt)
+
+    @staticmethod
+    def _predicted_xyz(track: Track3D, time_s: float) -> np.ndarray:
+        state = track.kf.statePost.ravel()
+        dt = max(1e-3, time_s - track.last_t)
+        return state[:3] + state[3:6] * dt
+
+    def _xyz_in_range(self, xyz: np.ndarray, poses: dict[str, CameraPose]) -> bool:
+        distance = range_from_cameras(xyz, poses)
+        return self.profile.r_min <= distance <= self.profile.r_max
+
+    def _pick_track_for_xyz(
+        self, xyz: np.ndarray, time_s: float, poses: dict[str, CameraPose]
+    ) -> int | None:
+        if not self._xyz_in_range(xyz, poses):
+            return None
+        best_i: int | None = None
+        best_jump = float("inf")
+        for i, track in enumerate(self.tracks3d):
+            if not track.ready:
+                continue
+            pred = self._predicted_xyz(track, time_s)
+            jump = float(np.linalg.norm(xyz - pred))
+            dt = max(1e-3, time_s - track.last_t)
+            if jump <= self._jump_cap(dt) and jump < best_jump:
+                best_jump = jump
+                best_i = i
+        if best_i is not None:
+            return best_i
+        for i, track in enumerate(self.tracks3d):
+            if not track.ready:
+                return i
+        if len(self.tracks3d) < MAX_TRACKS3D:
+            self.tracks3d.append(Track3D(self.profile))
+            self.target_id += 1
+            return len(self.tracks3d) - 1
+        return None
+
+    def _update_tracks3d(
+        self,
+        xyz: np.ndarray | None,
+        time_s: float,
+        poses: dict[str, CameraPose],
+    ) -> WorldView:
+        assigned: int | None = None
+        if xyz is not None:
+            assigned = self._pick_track_for_xyz(xyz, time_s, poses)
+        main: WorldView | None = None
+        for i, track in enumerate(self.tracks3d):
+            measurement = xyz if i == assigned else None
+            world = track.update(measurement, time_s, poses)
+            if i == 0:
+                main = world
+        self.track3d = self.tracks3d[0]
+        assert main is not None
+        return main
 
     def _close(self) -> None:
         for pipeline in self.pipelines:

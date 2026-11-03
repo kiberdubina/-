@@ -1,6 +1,5 @@
 import threading
 import tkinter as tk
-from collections import deque
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
 
@@ -14,6 +13,7 @@ from app.rig import Rig
 from app.session import Session
 from app import phone_usb
 from app.source import BlankSource, SyntheticSource, VideoSource, find_phone_source
+from app.export_result import export_session_sample
 from app.view3d import SceneCanvas
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -140,8 +140,6 @@ class App(tk.Tk):
         self._last_tiles: dict[str, np.ndarray] = {}
         self._dismissed_phones: set[str] = set()
         self._scene_drag: tuple[int, int, int, int] | None = None
-        self._way1_track: np.ndarray | None = None
-        self._way1_shown = -1
 
         body = tk.Frame(self, bg="#1c1c1c")
         body.pack(fill="both", expand=True)
@@ -184,6 +182,8 @@ class App(tk.Tk):
         file_menu.add_command(label="Открыть видео…", command=self.open_video)
         file_menu.add_command(label="Добавить видео…", command=self.add_video)
         file_menu.add_command(label="URL потока…", command=self.open_url)
+        file_menu.add_command(label="Сохранить контроль…", command=self.save_control)
+        file_menu.add_command(label="Отчёт погрешности…", command=self.save_metrics)
         file_menu.add_separator()
         file_menu.add_command(label="Выход", command=self.destroy)
         menu.add_cascade(label="Файл", menu=file_menu)
@@ -209,8 +209,55 @@ class App(tk.Tk):
         menu.add_cascade(label="Калибровка", menu=board_menu)
         self.config(menu=menu)
 
+    def save_control(self) -> None:
+        folder = filedialog.askdirectory(
+            title="Папка для контрольного результата",
+            initialdir=str(ROOT / "reports"),
+        )
+        if not folder:
+            return
+        out_dir = Path(folder)
+        try:
+            info = export_session_sample(self.session, out_dir)
+        except Exception as error:
+            messagebox.showerror("Сохранить контроль", str(error))
+            return
+        parts = [f"Кадров: {info.get('frames', 0)}"]
+        video = info.get("video")
+        if video is not None:
+            parts.append(f"Видео: {Path(video).name}")
+        if info.get("csv") is not None:
+            parts.append("xyz.csv")
+        charts = info.get("charts") or []
+        if charts:
+            parts.append(f"графики: {len(charts)}")
+        messagebox.showinfo("Сохранить контроль", "\n".join(parts))
+
+    def save_metrics(self) -> None:
+        """Сравнить след сессии с таблицей цели (эталон локально, не в git)."""
+        from app.metrics3d import compare_tracks, load_truth_meters, write_metrics_report
+
+        if not self.session.trail3d:
+            messagebox.showwarning("Погрешность", "След 3D пуст. Сначала нужен прогон с XYZ.")
+            return
+        try:
+            truth = load_truth_meters(ROOT)
+        except Exception as error:
+            messagebox.showerror("Погрешность", f"Эталон не прочитан: {error}")
+            return
+        est = np.stack([np.asarray(p, np.float64).reshape(3) for p in self.session.trail3d])
+        stats = compare_tracks(est, truth)
+        out = ROOT / "reports" / "metrics.txt"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        write_metrics_report(stats, out)
+        messagebox.showinfo(
+            "Погрешность",
+            f"RMSE {stats.get('rmse_m', float('nan')):.3f} м\n"
+            f"медиана {stats.get('median_m', float('nan')):.3f} м\n"
+            f"файл {out.name}",
+        )
+
     def open_phone(self) -> None:
-        self._stop_way1()
         self._dismissed_phones.clear()
         self.status.configure(text="Подключаю камеру телефона…")
         self.update_idletasks()
@@ -218,13 +265,11 @@ class App(tk.Tk):
         self._attach_usb_phones(menu=True)
 
     def use_demo(self) -> None:
-        self._stop_way1()
         self.auto_phone = False
         self.focus = None
         self.session.set_sources([SyntheticSource()])
 
     def use_rig(self) -> None:
-        self._stop_way1()
         self.auto_phone = False
         self.focus = None
         pattern = self.patterns.get("green_ball")
@@ -235,57 +280,27 @@ class App(tk.Tk):
         self.session.set_rig(Rig())
 
     def use_way1(self) -> None:
-        from app.cine_table import track_meters
         from app.way1_show import load_way1
 
         self.auto_phone = False
         self.focus = None
+        pattern = self.patterns.get("way1")
+        if pattern is not None:
+            pattern.predict_s = self.profile.predict_s
+            self.profile = pattern
+            self.session.set_profile(pattern)
         try:
             sources, poses = load_way1(ROOT)
-            track = track_meters(ROOT)
         except Exception as error:
             messagebox.showerror("Путь 5 камер", str(error))
             return
         self.session.set_sources(sources, poses)
+        self.session.set_pose_source(ROOT)
         self.trails.clear()
         self.zoom_state.clear()
-        self._way1_track = track
-        self._way1_shown = -1
-        self.session.trail3d = deque(maxlen=max(4000, int(track.shape[0]) + 8))
         self.status.configure(
-            text=f"{len(sources)} камер. Траектория строится по мере движения цели."
+            text=f"{len(sources)} камер. След 3D — только триангуляция по кадрам."
         )
-
-    def _stop_way1(self) -> None:
-        self._way1_track = None
-        self._way1_shown = -1
-
-    def _way1_frame(self) -> int | None:
-        """Кадр, который уже показали все открытые ролики. Вперёд не забегаем."""
-        indexes = []
-        for pipeline in self.session.pipelines:
-            index = getattr(pipeline.source, "index", None)
-            if isinstance(index, int) and index > 0:
-                indexes.append(index - 1)
-        if not indexes:
-            return None
-        return min(indexes)
-
-    def _advance_way1(self) -> None:
-        """Добавляет в след только положение на уже показанном кадре."""
-        if self._way1_track is None:
-            return
-        from app.way1_show import points_until
-
-        frame = self._way1_frame()
-        if frame is None:
-            return
-        points, shown, restart = points_until(self._way1_track, self._way1_shown, frame)
-        if restart:
-            self.session.trail3d.clear()
-        for point in points:
-            self.session.trail3d.append(np.asarray(point, np.float64).reshape(3))
-        self._way1_shown = shown
 
     def open_video(self) -> None:
         path = filedialog.askopenfilename(
@@ -300,7 +315,6 @@ class App(tk.Tk):
             messagebox.showerror("Трекинг 3D", "Файл не открылся.")
             return
         self.focus = None
-        self._stop_way1()
         self.session.set_sources([source])
 
     def add_video(self) -> None:
@@ -314,7 +328,6 @@ class App(tk.Tk):
         if not source.is_open():
             messagebox.showerror("Трекинг 3D", "Файл не открылся.")
             return
-        self._stop_way1()
         self.session.add_source(source)
 
     def open_url(self) -> None:
@@ -334,7 +347,6 @@ class App(tk.Tk):
             messagebox.showerror("Трекинг 3D", "Поток не открылся.")
             return
         self.focus = None
-        self._stop_way1()
         if replace:
             self.session.set_sources([source])
         else:
@@ -557,9 +569,6 @@ class App(tk.Tk):
     def tick(self) -> None:
         alive = self.session.step()
         stuck = self._release_stuck_phone()
-        self._advance_way1()
-        if alive is not None:
-            alive.trail = list(self.session.trail3d)
         if alive is not None and not stuck:
             self._draw(alive)
         if self._phone_wait_text:

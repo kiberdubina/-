@@ -104,3 +104,17 @@ patterns:
       v_max: 55
     require_motion: true
     moving_camera: false
+  # Дальняя трасса Way1: r_* — дальность от ближайшей камеры, не от нуля мира.
+  way1:
+    s_min: 40.0
+    s_max: 120000.0
+    u_min: 1.0
+    u_max: 8000.0
+    r_min: 1.0
+    r_max: 600.0
+    v_min: 0.05
+    v_max: 120.0
+    d_m: null
+    color: null
+    moving_camera: false
+    require_motion: false

@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from app.geom import CameraPose, velocity_in_camera
+from app.geom import CameraPose, range_from_cameras, velocity_in_camera
 from app.profile import TargetProfile
 
 
@@ -55,7 +55,7 @@ class Track3D:
             self.ready = True
             self.last_t = time_s
             self.miss = 0
-            return self._view(True)
+            return self._view(True, poses)
 
         dt = max(1e-3, time_s - self.last_t)
         self.last_t = time_s
@@ -66,23 +66,31 @@ class Track3D:
         self.kf.transitionMatrix = transition
         self.kf.predict()
         fresh = False
-        if xyz is not None and self._accept(xyz, dt):
+        if xyz is not None and self._accept(xyz, dt, poses):
             self.kf.correct(np.array(xyz, np.float32).reshape(3, 1))
             self.miss = 0
             fresh = True
         else:
             self.miss += 1
-            if self.miss > 12:
-                self.reset()
-                return WorldView(False, None, 0.0, None)
+            # Долгий пропуск: трек «засыпает», но состояние и след снаружи не стираем.
+            if self.miss > 90:
+                self.ready = False
+                return WorldView(False, None, 0.0, None, {}, False)
         return self._view(fresh, poses)
 
-    def _accept(self, xyz: np.ndarray, dt: float) -> bool:
+    def _accept(
+        self,
+        xyz: np.ndarray,
+        dt: float,
+        poses: dict[str, CameraPose] | None = None,
+    ) -> bool:
         predicted = self.kf.statePre[:3, 0]
         jump = float(np.linalg.norm(xyz - predicted))
-        if jump > max(0.15, self.profile.v_max * dt):
+        # Нижняя планка скачка растёт с v_max: на столе ~0,15 м, на трассе — доля шага.
+        jump_cap = max(0.15, 0.35 * self.profile.v_max * dt, self.profile.v_max * dt)
+        if jump > jump_cap:
             return False
-        distance = float(np.linalg.norm(xyz))
+        distance = range_from_cameras(xyz, poses or {})
         return self.profile.r_min <= distance <= self.profile.r_max
 
     def _view(self, fresh: bool, poses: dict[str, CameraPose] | None = None) -> WorldView:

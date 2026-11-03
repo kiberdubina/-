@@ -2,8 +2,6 @@ import sys
 import unittest
 from pathlib import Path
 
-import numpy as np
-
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -34,31 +32,10 @@ class Way1ShowTest(unittest.TestCase):
                 if close is not None:
                     close()
 
-    def test_track_grows_only_up_to_the_current_frame(self):
-        from app.way1_show import points_until
+    def test_points_until_not_exported(self):
+        import app.way1_show as way1_show
 
-        track = np.array(
-            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
-            np.float64,
-        )
-        first, shown, restart = points_until(track, -1, 0)
-        self.assertEqual(len(first), 1)
-        self.assertEqual(shown, 0)
-        self.assertFalse(restart)
-        self.assertTrue(np.allclose(first[0], [0.0, 0.0, 0.0]))
-        more, shown, restart = points_until(track, shown, 2)
-        self.assertEqual(len(more), 2)
-        self.assertEqual(shown, 2)
-        self.assertFalse(restart)
-        self.assertTrue(np.allclose(more[-1], [2.0, 0.0, 0.0]))
-        ahead, shown, restart = points_until(track, shown, 2)
-        self.assertEqual(ahead, [])
-        self.assertEqual(shown, 2)
-        self.assertFalse(restart)
-        again, shown, restart = points_until(track, shown, 0)
-        self.assertTrue(restart)
-        self.assertEqual(shown, 0)
-        self.assertEqual(len(again), 1)
+        self.assertFalse(hasattr(way1_show, "points_until"))
 
 
 if __name__ == "__main__":

@@ -47,6 +47,15 @@ def camera_center(pose: CameraPose) -> np.ndarray:
     return (-rotation.T @ pose.tvec.reshape(3)).ravel()
 
 
+def range_from_cameras(xyz: np.ndarray, poses: list[CameraPose] | dict) -> float:
+    """Дальность цели: до ближайшей камеры. Без поз — модуль от нуля мира."""
+    point = np.asarray(xyz, np.float64).reshape(3)
+    items = list(poses.values()) if isinstance(poses, dict) else list(poses)
+    if not items:
+        return float(np.linalg.norm(point))
+    return float(min(np.linalg.norm(point - camera_center(pose)) for pose in items))
+
+
 def frustum_edges(pose: CameraPose, depth: float = 0.15) -> list[tuple[np.ndarray, np.ndarray]]:
     rotation, _ = cv2.Rodrigues(pose.rvec)
     center = camera_center(pose)
