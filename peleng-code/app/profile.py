@@ -1,7 +1,23 @@
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
+
+# Цель по описанию (app.object_detector): класс COCO + цвет или текстовый запрос.
+DESCRIBED_MODES = ("object", "text")
+
+# Пороги профиля по описанию, если в config.yaml их нет: отбор делает модель.
+_DESCRIBED_GATES = {
+    "s_min": 0.0,
+    "s_max": 1e9,
+    "u_min": 0.0,
+    "u_max": 1e5,
+    "r_min": 0.02,
+    "r_max": 1000.0,
+    "v_min": 0.0,
+    "v_max": 200.0,
+}
 
 
 @dataclass
@@ -40,6 +56,11 @@ class TargetProfile:
     require_motion: bool = False
     # motion | ego(via moving_camera) | color | sky_dark | white_blob
     mode: str = "auto"
+    # Наземная машина: габарит 3D-ящика и опорная точка (см. app.vehicle.VehicleModel).
+    # Есть — 3D считается подгонкой ящика к рамкам камер, нет — триангуляцией точки.
+    vehicle: dict | None = None
+    # mode object | text: поля профиля для app.object_detector.parse_spec.
+    detect: dict | None = None
 
     @property
     def horizon_s(self) -> float:
@@ -61,22 +82,28 @@ def _color(data) -> ColorGate | None:
 
 
 def _profile(name: str, target: dict, predict_s: float) -> TargetProfile:
+    mode = str(target.get("mode", "auto"))
+    described = mode.lower() in DESCRIBED_MODES
+    gates = {**_DESCRIBED_GATES, **target} if described else target
     return TargetProfile(
         name=name,
-        s_min=float(target["s_min"]),
-        s_max=float(target["s_max"]),
-        u_min=float(target["u_min"]),
-        u_max=float(target["u_max"]),
-        r_min=float(target["r_min"]),
-        r_max=float(target["r_max"]),
-        v_min=float(target["v_min"]),
-        v_max=float(target["v_max"]),
+        s_min=float(gates["s_min"]),
+        s_max=float(gates["s_max"]),
+        u_min=float(gates["u_min"]),
+        u_max=float(gates["u_max"]),
+        r_min=float(gates["r_min"]),
+        r_max=float(gates["r_max"]),
+        v_min=float(gates["v_min"]),
+        v_max=float(gates["v_max"]),
         d_m=None if target.get("d_m") is None else float(target["d_m"]),
         predict_s=predict_s,
-        color=_color(target),
+        # У профиля по описанию цвет — список диапазонов внутри рамки, не ColorGate.
+        color=None if described else _color(target),
         moving_camera=bool(target.get("moving_camera", False)),
         require_motion=bool(target.get("require_motion", False)),
-        mode=str(target.get("mode", "auto")),
+        mode=mode,
+        vehicle=dict(target["vehicle"]) if target.get("vehicle") else None,
+        detect=dict(target) if described else None,
     )
 
 
@@ -113,13 +140,40 @@ def load_board(path: Path) -> BoardSpec:
     )
 
 
+def save_active(path: Path, name: str, predict_s: float) -> None:
+    """Только активный профиль и горизонт. Строки правятся на месте: комментарии остаются."""
+    text = path.read_text(encoding="utf-8")
+    lines = {"active": name, "predict_s": predict_s}
+    for key, value in lines.items():
+        pattern = re.compile(rf"^{key}:.*$", re.MULTILINE)
+        if pattern.search(text) is None:
+            data = load_document(path)
+            data["active"] = name
+            data["predict_s"] = predict_s
+            _dump(path, data)
+            return
+        text = pattern.sub(f"{key}: {value}", text, count=1)
+    path.write_text(text, encoding="utf-8")
+
+
+def save_pattern(path: Path, name: str, fields: dict, predict_s: float) -> None:
+    """Профиль name целиком из fields и сделать его активным."""
+    data = load_document(path)
+    data["predict_s"] = predict_s
+    data["active"] = name
+    data.setdefault("patterns", {})[name] = dict(fields)
+    _dump(path, data)
+
+
 def save_custom(path: Path, profile: TargetProfile, predict_s: float) -> None:
     data = load_document(path)
     data["predict_s"] = predict_s
     data["active"] = profile.name
     if "patterns" not in data:
         data["patterns"] = {}
-    data["patterns"][profile.name] = {
+    # Поля, которых профиль не задаёт (mode, vehicle, class…), остаются как были.
+    entry = dict(data["patterns"].get(profile.name) or {})
+    entry.update({
         "s_min": profile.s_min,
         "s_max": profile.s_max,
         "u_min": profile.u_min,
@@ -141,7 +195,14 @@ def save_custom(path: Path, profile: TargetProfile, predict_s: float) -> None:
         },
         "moving_camera": profile.moving_camera,
         "require_motion": profile.require_motion,
-    }
+    })
+    if profile.detect is not None:
+        entry["color"] = profile.detect.get("color")
+    data["patterns"][profile.name] = entry
+    _dump(path, data)
+
+
+def _dump(path: Path, data: dict) -> None:
     path.write_text(
         yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
         encoding="utf-8",

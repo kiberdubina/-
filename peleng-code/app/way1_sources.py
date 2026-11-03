@@ -3,24 +3,27 @@ from pathlib import Path
 import cv2
 
 from app.source import VideoSource
+from app.way1_files import find_file
 
 # Номер в имени файла Way1.FinalImage.CineCameraActorN.mp4 → cam-N.
 _CAMERAS = tuple(f"cam-{number}" for number in range(1, 6))
 
 
-def _clip_path(root: Path, camera_id: str) -> Path:
+def _clip_name(camera_id: str) -> str:
     number = camera_id.rsplit("-", 1)[1]
-    return root / f"Way1.FinalImage.CineCameraActor{number}.mp4"
+    return f"Way1.FinalImage.CineCameraActor{number}.mp4"
 
 
 def video_paths(root: Path) -> dict[str, Path]:
-    """Ключи cam-1…cam-5. Нет файла — KeyError с его именем."""
+    """Ключи cam-1…cam-5. Файл ищется в корне и в подпапках (видео/ и др.).
+    Нет файла — KeyError с его именем."""
     paths: dict[str, Path] = {}
     for camera_id in _CAMERAS:
-        path = _clip_path(root, camera_id)
-        if not path.is_file():
-            raise KeyError(path.name)
-        paths[camera_id] = path
+        name = _clip_name(camera_id)
+        try:
+            paths[camera_id] = find_file(Path(root), name)
+        except FileNotFoundError:
+            raise KeyError(name) from None
     return paths
 
 

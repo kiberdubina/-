@@ -118,3 +118,35 @@ patterns:
     color: null
     moving_camera: false
     require_motion: false
+    # Цель — фура (SM_AA_track). Ящик относительно задней оси на земле:
+    # вперёд, влево, вверх, метры. anchor_m — опорная точка (pivot) 3D-модели,
+    # её координаты даёт таблица object_transform_SM_AA_track. Габарит и pivot
+    # определены подгонкой ящика к силуэтам камер 1–4 (см. docs/защита.md).
+    vehicle:
+      front_m: 14.12
+      rear_m: -5.54
+      width_m: 5.13
+      height_m: 6.43
+      anchor_m: [15.43, -0.11, 3.01]
+  # Цель по описанию (app/object_detector.py, нужен requirements-detect.txt и веса в models/).
+  # s_*/u_*/r_*/v_* можно не задавать: отбор делает модель. Площадь — площадь рамки.
+  black_hoodie_person:
+    mode: object
+    class: person
+    conf: 0.4
+    region: upper
+    color: {h_min: 0, h_max: 180, s_min: 0, s_max: 255, v_min: 0, v_max: 60}
+    color_share: 0.35
+  red_car:
+    mode: object
+    class: car
+    conf: 0.4
+    region: full
+    color:
+      - {h_min: 0, h_max: 10, s_min: 120, s_max: 255, v_min: 70, v_max: 255}
+      - {h_min: 170, h_max: 180, s_min: 120, s_max: 255, v_min: 70, v_max: 255}
+    color_share: 0.25
+  truck_text:
+    mode: text
+    query: ["truck", "cargo truck"]
+    conf: 0.25

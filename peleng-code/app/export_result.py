@@ -9,40 +9,62 @@ import cv2
 import numpy as np
 
 
+class VideoSink:
+    """Потоковая запись BGR-кадров: MP4 (mp4v), при отказе кодека — AVI (XVID).
+
+    Размер берётся с первого кадра, остальные приводятся к нему.
+    """
+
+    def __init__(self, path: Path, fps: float = 30.0):
+        self.requested = Path(path)
+        self.fps = float(fps)
+        self.path: Path | None = None
+        self.size: tuple[int, int] | None = None
+        self._writer: cv2.VideoWriter | None = None
+
+    def write(self, frame: np.ndarray) -> None:
+        if self._writer is None:
+            self._open(frame)
+        assert self._writer is not None and self.size is not None
+        if (frame.shape[1], frame.shape[0]) != self.size:
+            frame = cv2.resize(frame, self.size, interpolation=cv2.INTER_LINEAR)
+        self._writer.write(frame)
+
+    def _open(self, frame: np.ndarray) -> None:
+        path = self.requested
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.size = (int(frame.shape[1]), int(frame.shape[0]))
+        attempts = [
+            (path if path.suffix else path.with_suffix(".mp4"), "mp4v"),
+            (path.with_suffix(".avi"), "XVID"),
+        ]
+        for out_path, fourcc in attempts:
+            writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*fourcc), self.fps, self.size)
+            if writer.isOpened():
+                self._writer = writer
+                self.path = out_path
+                return
+            writer.release()
+        raise RuntimeError("VideoSink: кодек не открылся")
+
+    def close(self) -> Path:
+        if self._writer is None or self.path is None:
+            raise ValueError("VideoSink: нет кадров")
+        self._writer.release()
+        self._writer = None
+        return self.path
+
+
 def write_control_video(
     frames_bgr: list[np.ndarray], path: Path, fps: float = 30.0
 ) -> Path:
     """Сохраняет последовательность BGR-кадров в MP4 или AVI."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
     if not frames_bgr:
         raise ValueError("write_control_video: нет кадров")
-    height, width = frames_bgr[0].shape[:2]
-    size = (width, height)
-    attempts: list[tuple[Path, str]] = [
-        (path if path.suffix else path.with_suffix(".mp4"), "mp4v"),
-        (path.with_suffix(".avi") if path.suffix.lower() != ".avi" else path, "XVID"),
-    ]
-    seen: set[Path] = set()
-    for out_path, fourcc_str in attempts:
-        if out_path in seen:
-            continue
-        seen.add(out_path)
-        writer = cv2.VideoWriter(
-            str(out_path),
-            cv2.VideoWriter_fourcc(*fourcc_str),
-            float(fps),
-            size,
-        )
-        if not writer.isOpened():
-            continue
-        for frame in frames_bgr:
-            if frame.shape[:2] != (height, width):
-                frame = cv2.resize(frame, size, interpolation=cv2.INTER_LINEAR)
-            writer.write(frame)
-        writer.release()
-        return out_path
-    raise RuntimeError("write_control_video: кодек не открылся")
+    sink = VideoSink(path, fps)
+    for frame in frames_bgr:
+        sink.write(frame)
+    return sink.close()
 
 
 def write_xyz_csv(

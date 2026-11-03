@@ -12,8 +12,12 @@ from app.cine_table import track_meters
 HIT_THRESHOLD_M = 10.0
 
 _METRIC_LABELS = {
+    "frames": "Кадров с оценкой",
+    "coverage": "Покрытие записи",
     "rmse_m": "RMSE, м",
+    "mean_m": "Средняя ошибка, м",
     "median_m": "Медиана ошибки, м",
+    "p95_m": "95-й перцентиль, м",
     "max_m": "Максимум ошибки, м",
     "rmse_x": "RMSE X, м",
     "rmse_y": "RMSE Y, м",
@@ -92,14 +96,59 @@ def compare_tracks_nearest(est: np.ndarray, truth: np.ndarray) -> dict:
     return _stats_from_diff(diff)
 
 
+def compare_by_frame(
+    frames: list[int] | np.ndarray, est: np.ndarray, truth: np.ndarray, total_frames: int | None = None
+) -> dict:
+    """Погрешность по номерам кадров: est[i] сравнивается с truth[frames[i]].
+
+    Кадры вне таблицы отбрасываются. coverage — доля кадров записи, для которых есть
+    оценка (знаменатель — total_frames или длина таблицы).
+    """
+    frames = np.asarray(frames, dtype=np.int64).reshape(-1)
+    est = _as_track(est)
+    truth = _as_track(truth)
+    if frames.size != est.shape[0]:
+        raise ValueError("frames и est разной длины")
+    inside = (frames >= 0) & (frames < truth.shape[0])
+    frames = frames[inside]
+    est = est[inside]
+    stats = compare_tracks(est, truth[frames]) if frames.size else compare_tracks(est[:0], truth[:0])
+    total = int(total_frames) if total_frames is not None else int(truth.shape[0])
+    stats["frames"] = int(frames.size)
+    stats["coverage"] = float(np.unique(frames).size / total) if total > 0 else 0.0
+    if frames.size:
+        err = np.linalg.norm(est - truth[frames], axis=1)
+        stats["p95_m"] = float(np.percentile(err, 95))
+        stats["mean_m"] = float(np.mean(err))
+    else:
+        stats["p95_m"] = float("nan")
+        stats["mean_m"] = float("nan")
+    return stats
+
+
+def frame_errors(frames: list[int] | np.ndarray, est: np.ndarray, truth: np.ndarray) -> np.ndarray:
+    """Евклидова ошибка на каждом кадре (NaN, если кадра нет в таблице)."""
+    frames = np.asarray(frames, dtype=np.int64).reshape(-1)
+    est = _as_track(est)
+    truth = _as_track(truth)
+    out = np.full(frames.size, np.nan)
+    inside = (frames >= 0) & (frames < truth.shape[0])
+    out[inside] = np.linalg.norm(est[inside] - truth[frames[inside]], axis=1)
+    return out
+
+
 def write_metrics_report(stats: dict, path: Path) -> Path:
     """Текстовый отчёт UTF-8 с ключевыми метриками."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = ["Метрики 3D-трассы", f"Порог попадания: {HIT_THRESHOLD_M:g} м", ""]
     for key, label in _METRIC_LABELS.items():
+        if key not in stats and key in ("frames", "coverage", "mean_m", "p95_m"):
+            continue
         value = stats.get(key, float("nan"))
-        if key == "hit_ratio":
+        if key == "frames":
+            lines.append(f"{label}: {int(value)}")
+        elif key in ("hit_ratio", "coverage"):
             lines.append(f"{label}: {float(value):.4f}")
         elif np.isfinite(value):
             lines.append(f"{label}: {float(value):.6f}")

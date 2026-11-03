@@ -119,7 +119,9 @@ class SceneCanvas(tk.Canvas):
         poses: list[CameraPose],
         hint: str,
         rays: list[tuple[np.ndarray, np.ndarray]] | None = None,
+        box: np.ndarray | None = None,
     ) -> None:
+        self.box = None if box is None else np.asarray(box, np.float64).reshape(8, 3).copy()
         self.trail = [np.asarray(point, np.float64).reshape(3).copy() for point in trail]
         self.current = None if current is None else np.asarray(current, np.float64).reshape(3).copy()
         self.pred = None if pred is None else np.asarray(pred, np.float64).reshape(3).copy()
@@ -198,6 +200,9 @@ class SceneCanvas(tk.Canvas):
         for start, end in self.rays:
             samples.append(np.asarray(start, np.float64).reshape(3))
             samples.append(np.asarray(end, np.float64).reshape(3))
+        box = getattr(self, "box", None)
+        if box is not None:
+            samples.extend(box)
         bare = (
             not self.trail
             and self.current is None
@@ -324,6 +329,16 @@ class SceneCanvas(tk.Canvas):
                 "ray",
                 (3, 3),
             )
+        box = getattr(self, "box", None)
+        if box is not None:
+            from app.vehicle import BOX_EDGES
+
+            projected = self._project(box, target, distance, width, height)
+            for a, b in BOX_EDGES:
+                pa = self._xy(projected[a])
+                pb = self._xy(projected[b])
+                if pa is not None and pb is not None:
+                    self.create_line(*pa, *pb, fill="#5fd35f", width=2, tags="box")
         if len(self.trail) >= 2:
             trail = np.stack(self.trail, axis=0)
             self._polyline(
