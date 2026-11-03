@@ -25,6 +25,14 @@ MAX_TRACKS3D = 4
 LIVE_WORK_WIDTH = 640
 # Запас вокруг проекции прогнозного ящика, где живой фон не учится, px полного кадра.
 HOLD_PAD_PX = 30
+# След живого режима машины (то, что идёт в отчёт погрешности по кадрам).
+TRAIL_WARMUP = 8          # первые точки после старта трека не пишутся: ящик ещё сходится
+TRAIL_STEP_M = 2.0        # дальше за кадр от прошлой точки — выброс (фура Way1: до ~1 м/кадр)
+# Точку в след пишем, когда цель видят хотя бы две камеры: по одной дальность не измерена.
+# Трек и прогноз при этом держатся. Way1: RMSE 6,3 → 3,3 м при покрытии 90 → 73 %.
+TRAIL_MIN_CAMERAS = 2
+TRAIL_REJECT_LIMIT = 5    # столько выбросов подряд — это не выброс, а исправление трека
+TRAIL_COAST = 5           # столько кадров без измерения пишется прогноз фильтра
 
 
 @dataclass
@@ -45,6 +53,8 @@ class Session:
         self.samples: dict[str, list] = {}
         self.pose_root: Path | None = None
         self.moving_pose_ids: set[str] = {"cam-5"}
+        # Папка любой записи (app.scene_folder): поза каждой камеры по номеру кадра из её таблицы.
+        self.pose_tables: dict = {}
         self.tracks3d: list[Track3D] = [Track3D(profile)]
         self.track3d = self.tracks3d[0]
         self.trail3d: deque[np.ndarray] = deque(maxlen=4000)
@@ -55,6 +65,7 @@ class Session:
         self.backgrounds: dict[str, StaticBackground | RotatingBackground] = {}
         # Последнее состояние 3D-ящика и его время: прогноз маски, где фон не учится.
         self._held: tuple[np.ndarray, float] | None = None
+        self._trail_reset()
         self._setup_vehicle()
         self.set_sources([source])
 
@@ -84,18 +95,29 @@ class Session:
         self.poses = dict(poses or {})
         self.samples.clear()
         self.pose_root = None
+        self.pose_tables = {}
         self.tracks3d = [Track3D(self.profile)]
         self.track3d = self.tracks3d[0]
         self.trail3d.clear()
         self.trail_frames.clear()
         self.backgrounds.clear()
         self._held = None
+        self._trail_reset()
         if self.vehicle is not None:
             self.vehicle.reset()
 
     def set_pose_source(self, root: Path | None) -> None:
         """Корень Way1 с CSV поз. После set_sources вызовите из use_way1(ROOT)."""
         self.pose_root = None if root is None else Path(root)
+
+    def set_pose_tables(self, tables: dict, moving: set[str]) -> None:
+        """Папка любой записи: поза камеры по кадру — tables[camera_id](frame). После set_sources.
+
+        moving — камеры, которые поворачиваются или едут: у них фон по направлению луча.
+        """
+        self.pose_tables = dict(tables)
+        self.moving_pose_ids = set(moving)
+        self.backgrounds.clear()
 
     def set_rig(self, rig: Rig) -> None:
         sources = [
@@ -142,7 +164,8 @@ class Session:
         if model is None:
             height, width = image.shape[:2]
             config = BackgroundConfig(work_width=LIVE_WORK_WIDTH)
-            rotating = self.pose_root is not None and camera_id in self.moving_pose_ids
+            known = self.pose_root is not None or camera_id in self.pose_tables
+            rotating = known and camera_id in self.moving_pose_ids
             model = (RotatingBackground if rotating else StaticBackground)(width, height, config)
             self.backgrounds[camera_id] = model
         return model
@@ -160,6 +183,7 @@ class Session:
                 self.backgrounds.pop(frame.camera_id, None)
                 self.vehicle.reset()
                 self._held = None
+                self._trail_reset()
             self._refresh_pose(pipeline, frame)
             frames.append(frame)
             pose = self.poses.get(frame.camera_id)
@@ -176,6 +200,7 @@ class Session:
         steps = [self._vehicle_step(frame, view.observed.get(frame.camera_id)) for frame in frames]
         if not view.active or view.state is None:
             self._held = None
+            self._trail_reset()
             return Tick(steps, WorldView(False, None, 0.0, None), list(self.trail3d))
         state = view.state
         self._held = (np.array(state, np.float64, copy=True), time_s)
@@ -188,11 +213,37 @@ class Session:
         velocity = float(state[V]) * state_axes(state)[0]
         relative = {camera_id: velocity_in_camera(velocity, pose) for camera_id, pose in self.poses.items()}
         world = WorldView(True, anchor, view.speed_m_s, ahead, relative, view.fresh)
-        if view.fresh:
+        if self._trail_accept(key, anchor, view.fresh, len(view.observed)):
             self.trail3d.append(anchor.copy())
             if key is not None:
                 self.trail_frames.append((int(key), anchor.copy()))
         return Tick(steps, world, list(self.trail3d), [], view.corners)
+
+    def _trail_reset(self) -> None:
+        self._trail_run = 0
+        self._trail_coast = 0
+        self._trail_rejects = 0
+        self._trail_last: tuple[int, np.ndarray] | None = None
+
+    def _trail_accept(self, key, anchor: np.ndarray, fresh: bool, cameras: int) -> bool:
+        """Писать ли точку в след: прогрев, короткий пропуск — прогноз, скачок — выброс."""
+        self._trail_run += 1
+        self._trail_coast = 0 if fresh else self._trail_coast + 1
+        if self._trail_run <= TRAIL_WARMUP or self._trail_coast > TRAIL_COAST:
+            return False
+        if fresh and cameras < TRAIL_MIN_CAMERAS:
+            return False
+        if key is not None and self._trail_last is not None:
+            last_key, last_point = self._trail_last
+            frames = max(1, int(key) - last_key)
+            if float(np.linalg.norm(anchor - last_point)) > TRAIL_STEP_M * frames:
+                self._trail_rejects += 1
+                if self._trail_rejects < TRAIL_REJECT_LIMIT:
+                    return False
+        self._trail_rejects = 0
+        if key is not None:
+            self._trail_last = (int(key), anchor.copy())
+        return True
 
     def _hold_mask(self, pose: CameraPose, time_s: float) -> np.ndarray | None:
         """Проекция прогнозного 3D-ящика на кадр камеры с запасом: там цель, фон не учится."""
@@ -252,6 +303,11 @@ class Session:
     def _refresh_pose(self, pipeline: Pipeline, frame) -> None:
         """Поза камеры, которая поворачивается, — по номеру кадра из таблицы записи."""
         camera_id = frame.camera_id
+        table = self.pose_tables.get(camera_id)
+        if table is not None:
+            number = int(frame.index) if frame.index is not None else max(0, int(getattr(pipeline.source, "index", 1)) - 1)
+            self.poses[camera_id] = table(number)
+            return
         if self.pose_root is None or camera_id not in self.moving_pose_ids:
             return
         from app.cine_table import pose_at
