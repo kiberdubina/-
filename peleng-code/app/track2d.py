@@ -23,6 +23,9 @@ TRAIL_MIN_PX = 3.0
 VELOCITY_WINDOW = 4
 # Потолок живого допуска: даже на большой скорости сотни пикселей не проходят.
 GATE_CAP_PX = 280.0
+# Новый трек — только после стольких измерений подряд. Вспышка листвы, тени или шума
+# на кадр-другой не рисует рамку, след и прогноз и не идёт в 3D.
+CONFIRM_HITS = 3
 
 
 @dataclass
@@ -90,6 +93,7 @@ class Track2D:
             self.miss_limit = 12
         self.ready = False
         self.miss = 0
+        self.hits = 0
         self.last_t = 0.0
         self.accepted: Detection | None = None
         self.last_bbox: tuple[int, int, int, int] | None = None
@@ -111,6 +115,7 @@ class Track2D:
     def reset(self) -> None:
         self.ready = False
         self.miss = 0
+        self.hits = 0
         self.last_t = 0.0
         self.accepted = None
         self.last_bbox = None
@@ -133,6 +138,7 @@ class Track2D:
             self.ready = True
             self.last_t = time_s
             self.miss = 0
+            self.hits = 1
             self._remember(spot, time_s)
             return self._view("захват", True, spot)
 
@@ -146,8 +152,10 @@ class Track2D:
         spot = self._pick_gated(found, self._gate_radius(dt))
         if spot is None:
             self.miss += 1
-            if self.miss > self.miss_limit:
+            # Неподтверждённый трек пропуска не переживает: это была вспышка, не цель.
+            if self.miss > self.miss_limit or self.hits < CONFIRM_HITS:
                 self.ready = False
+                self.hits = 0
                 self.last_bbox = None
                 return self._idle()
             return self._view(None, False, None)
@@ -155,6 +163,7 @@ class Track2D:
         measure = np.array([[np.float32(spot.cx)], [np.float32(spot.cy)]])
         self.kf.correct(measure)
         self.miss = 0
+        self.hits += 1
         self._remember(spot, time_s)
         self._snap_filter(spot)
         return self._view(None, True, spot)
@@ -173,18 +182,23 @@ class Track2D:
         return max(self.gate_px, min(grown, GATE_CAP_PX))
 
     def _measure_velocity(self) -> tuple[float, float]:
-        """Скорость по последним четырём измерениям. Иначе — скорость фильтра."""
+        """Скорость по последним четырём измерениям. Иначе — скорость фильтра.
+
+        Медиана скоростей по всем парам точек (оценка Тейла–Сена): один скачок центра на
+        соседнее пятно её не раздувает, и прогноз не улетает. Прямая МНК — раздувала.
+        """
         if len(self.samples) >= VELOCITY_WINDOW:
             window = self.samples[-VELOCITY_WINDOW:]
-            times = np.array([sample[2] for sample in window], dtype=np.float64)
-            xs = np.array([sample[0] for sample in window], dtype=np.float64)
-            ys = np.array([sample[1] for sample in window], dtype=np.float64)
-            centered = times - float(times.mean())
-            denom = float(np.dot(centered, centered))
-            if denom > 1e-8:
-                vx = float(np.dot(centered, xs - float(xs.mean())) / denom)
-                vy = float(np.dot(centered, ys - float(ys.mean())) / denom)
-                return vx, vy
+            slopes_x = []
+            slopes_y = []
+            for first in range(len(window)):
+                for second in range(first + 1, len(window)):
+                    span = window[second][2] - window[first][2]
+                    if span > 1e-4:
+                        slopes_x.append((window[second][0] - window[first][0]) / span)
+                        slopes_y.append((window[second][1] - window[first][1]) / span)
+            if slopes_x:
+                return float(np.median(slopes_x)), float(np.median(slopes_y))
         return float(self.kf.statePost[2, 0]), float(self.kf.statePost[3, 0])
 
     def _snap_filter(self, spot: Detection) -> None:
@@ -261,7 +275,10 @@ class Track2D:
         speed = float(math.hypot(vx, vy))
         horizon = max(0.0, self.horizon_s)
         in_gate = self.profile.u_min <= speed <= self.profile.u_max
-        if state is None:
+        confirmed = self.hits >= CONFIRM_HITS
+        if not confirmed:
+            state = "проверка"
+        elif state is None:
             state = "сопровождение" if in_gate else "вне порога скорости"
         if spot is not None:
             bbox = spot.bbox
@@ -271,6 +288,9 @@ class Track2D:
             bbox = None
         pred_bbox = None if bbox is None else _shift_bbox(bbox, vx * horizon, vy * horizon)
         area = None if spot is None else spot.area
+        if not confirmed:
+            # Ещё не цель: без рамки, следа и прогноза на экране и без измерения для 3D.
+            return self._pack(False, cx, cy, vx, vy, state, False, False, None, None, area, horizon)
         return self._pack(
             True, cx, cy, vx, vy, state, in_gate, measured, bbox, pred_bbox, area, horizon
         )

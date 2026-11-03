@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 from app.calib import BoardDetector, pose_from_view
 from app.geom import triangulate
 from app.motion import Detection
+from app.track2d import CONFIRM_HITS
 from app.pipeline import Pipeline
 from app.profile import load_board, load_patterns, load_profile
 from app.rig import Rig
@@ -122,7 +123,9 @@ class IterationTest(unittest.TestCase):
             self.assertIsNotNone(tick)
             last = tick
             self.assertEqual(len(tick.steps), 2)
-            self.assertTrue(all(step.track.active for step in tick.steps))
+            # Трек становится целью после CONFIRM_HITS измерений подряд.
+            if index >= CONFIRM_HITS - 1:
+                self.assertTrue(all(step.track.active for step in tick.steps))
             ids = {step.frame.camera_id for step in tick.steps}
             self.assertEqual(ids, {"A", "B"})
             self.assertEqual(set(session.poses), {"A", "B"})

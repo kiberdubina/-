@@ -91,7 +91,7 @@ class Session:
         if not spec:
             self.vehicle = None
             return
-        config = FusionConfig(range_m=(self.profile.r_min, self.profile.r_max))
+        config = FusionConfig(range_m=(self.profile.r_min, self.profile.r_max), hold_motion_single=True)
         self.vehicle = VehicleFusion(VehicleModel.from_config(spec), config)
 
     def set_profile(self, profile: TargetProfile) -> None:
@@ -129,6 +129,7 @@ class Session:
     def set_pose_source(self, root: Path | None) -> None:
         """Корень Way1 с CSV поз. После set_sources вызовите из use_way1(ROOT)."""
         self.pose_root = None if root is None else Path(root)
+        self._mark_moving()
 
     # ------------------------------------------------------------ выбранная машина
 
@@ -223,6 +224,14 @@ class Session:
         self.pose_tables = dict(tables)
         self.moving_pose_ids = set(moving)
         self.backgrounds.clear()
+        self._mark_moving()
+
+    def _mark_moving(self) -> None:
+        """Камеры с известным поворотом по кадрам: их детектор движения — с компенсацией поворота."""
+        for pipeline in self.pipelines:
+            camera_id = getattr(pipeline.source, "camera_id", None)
+            known = self.pose_root is not None or camera_id in self.pose_tables
+            pipeline.set_moving(known and camera_id in self.moving_pose_ids)
 
     def set_rig(self, rig: Rig) -> None:
         sources = [
@@ -233,6 +242,7 @@ class Session:
 
     def add_source(self, source) -> None:
         self.pipelines.append(Pipeline(self.profile, source))
+        self._mark_moving()
 
     def drop_pipeline(self, pipeline: Pipeline) -> None:
         """Закрывает один источник. Остальные камеры и след 3D не сбрасывает."""

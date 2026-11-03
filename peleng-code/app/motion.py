@@ -32,6 +32,9 @@ class MotionDetector:
         self._still_prev: np.ndarray | None = None
         # Дырявое пятно руки сшивается, шум в пару пикселей — нет.
         self.diff_close = np.ones((15, 15), np.uint8)
+        # Камера этого конвейера поворачивается (её поза меняется по кадрам): вычитание фона
+        # MOG2 там видит движение всего кадра, нужен ego — с компенсацией поворота.
+        self.force_ego = False
 
     def detect(self, image: np.ndarray) -> list[Detection]:
         mode = (self.profile.mode or "auto").lower()
@@ -39,7 +42,7 @@ class MotionDetector:
             return self._spots(self._sky_dark_mask(image))
         if mode == "white_blob":
             return self._spots(self._white_blob_mask(image))
-        if self.profile.moving_camera or mode == "ego":
+        if self.profile.moving_camera or mode == "ego" or self.force_ego:
             return self._ego(image)
         if self.profile.color is not None and self.profile.require_motion:
             color = self._color_mask(image)

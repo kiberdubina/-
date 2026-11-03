@@ -25,13 +25,22 @@ class Pipeline:
         self.source = source
         # Детектор по описанию не собрался (нет пакета, весов) — текст для строки статуса.
         self.detector_error: str | None = None
+        # Камера поворачивается (Session знает её позы по кадрам): детектор движения — ego.
+        self.moving = False
         self.detector = self._make_detector()
         self.tracker = MultiTrack2D(profile)
         self._last: TrackView | None = None
 
     def _make_detector(self):
         detector, self.detector_error = build_detector(self.profile, self.profile.detect)
+        if hasattr(detector, "force_ego"):
+            detector.force_ego = self.moving
         return detector
+
+    def set_moving(self, moving: bool) -> None:
+        self.moving = bool(moving)
+        if hasattr(self.detector, "force_ego"):
+            self.detector.force_ego = self.moving
 
     def set_profile(self, profile: TargetProfile) -> None:
         described = self.profile.mode in DESCRIBED_MODES or profile.mode in DESCRIBED_MODES

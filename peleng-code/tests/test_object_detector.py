@@ -339,18 +339,20 @@ class PipelineTest(unittest.TestCase):
         model = FakeModel([(0.4, 0.3, 0.6, 0.7, 0.9, "car")])
         profile = self._profile("red_car")
         profile.detect = dict(profile.detect, color=None, det_every=1)
+        from app.track2d import CONFIRM_HITS
+
         with mock.patch("app.object_detector.load_model", return_value=model):
-            pipeline = Pipeline(profile, _Frames())
-            first = pipeline.step()
-            second = pipeline.step()
+            pipeline = Pipeline(profile, _Frames(CONFIRM_HITS + 1))
+            steps = [pipeline.step() for _ in range(CONFIRM_HITS + 1)]
         self.assertIsInstance(pipeline.detector, ObjectDetector)
         self.assertIsNone(pipeline.detector_error)
-        self.assertEqual(first.labels[0].name, "car")
-        self.assertIsNotNone(first.detection)
-        # Второй запуск ищет в окне вокруг трека, не по всему кадру.
+        self.assertEqual(steps[0].labels[0].name, "car")
+        self.assertIsNotNone(steps[0].detection)
+        # Пока трек не подтверждён — весь кадр; потом поиск в окне вокруг трека.
         self.assertEqual(model.shapes[0], (640, 360))
-        self.assertLess(model.shapes[1][0], 640)
-        self.assertIsNotNone(second.detection)
+        self.assertTrue(steps[CONFIRM_HITS - 1].track.active)
+        self.assertLess(model.shapes[CONFIRM_HITS][0], 640)
+        self.assertIsNotNone(steps[CONFIRM_HITS].detection)
 
     def test_pipeline_falls_back_and_reports_error(self):
         from app.pipeline import Pipeline
