@@ -4,3 +4,4 @@ pillow
 pyyaml
 av
 matplotlib>=3.7
+openpyxl>=3.1

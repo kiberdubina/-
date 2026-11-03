@@ -1,3 +1,5 @@
+import dataclasses
+import sys
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -158,8 +160,10 @@ class App(tk.Tk):
         # Сначала поле 3D справа, остаток ширины — камерам. Рост поля забирает этот остаток.
         self.scene.pack(side="right", anchor="n", padx=(0, 8), pady=8)
         self.cameras.pack(side="left", fill="both", expand=True, padx=(8, 4), pady=8)
+        # size_ne_sw есть только в Tk под Windows; на macOS и Linux — свой угловой курсор.
+        grip_cursor = "size_ne_sw" if sys.platform == "win32" else "bottom_left_corner"
         self._scene_grip = tk.Frame(
-            self.scene, width=16, height=16, bg="#5c6574", cursor="size_ne_sw"
+            self.scene, width=16, height=16, bg="#5c6574", cursor=grip_cursor
         )
         self._scene_grip.place(relx=0.0, rely=1.0, anchor="sw", width=16, height=16)
         self._scene_grip.bind("<ButtonPress-1>", self._scene_grip_press)
@@ -188,12 +192,14 @@ class App(tk.Tk):
         file_menu.add_command(label="Демо", command=self.use_demo)
         file_menu.add_command(label="Демо 3D", command=self.use_rig)
         file_menu.add_command(label="Путь 5 камер", command=self.use_way1)
+        file_menu.add_command(label="Открыть папку с роликами…", command=self.open_scene_folder)
         file_menu.add_command(label="Открыть видео…", command=self.open_video)
         file_menu.add_command(label="Добавить видео…", command=self.add_video)
         file_menu.add_command(label="URL потока…", command=self.open_url)
         file_menu.add_command(label="Сохранить контроль…", command=self.save_control)
         file_menu.add_command(label="Отчёт погрешности…", command=self.save_metrics)
         file_menu.add_command(label="Контрольный прогон Way1…", command=self.run_way1_control)
+        file_menu.add_command(label="Контрольный прогон папки…", command=self.run_folder_control)
         file_menu.add_separator()
         file_menu.add_command(label="Выход", command=self.destroy)
         menu.add_cascade(label="Файл", menu=file_menu)
@@ -246,6 +252,8 @@ class App(tk.Tk):
             parts.append(f"Видео: {Path(video).name}")
         if info.get("csv") is not None:
             parts.append("xyz.csv")
+        if info.get("xlsx") is not None:
+            parts.append("Excel: xyz.xlsx")
         charts = info.get("charts") or []
         if charts:
             parts.append(f"графики: {len(charts)}")
@@ -261,8 +269,17 @@ class App(tk.Tk):
                 "Погрешность", "Нет точек 3D с номером кадра. Сначала прогон записи с XYZ."
             )
             return
+        scene = getattr(self, "scene_folder", None)
         try:
-            truth = load_truth_meters(ROOT)
+            if self.session.pose_tables and scene is not None:
+                # Открыта папка любой записи: эталон — её таблица пути цели.
+                from app.scene_folder import scene_truth
+
+                truth = scene_truth(scene)
+                if truth is None:
+                    raise ValueError("в папке нет таблицы пути цели")
+            else:
+                truth = load_truth_meters(ROOT)
         except Exception as error:
             messagebox.showerror("Погрешность", f"Эталон не прочитан: {error}")
             return
@@ -286,7 +303,7 @@ class App(tk.Tk):
             messagebox.showinfo("Контрольный прогон", "Прогон уже идёт.")
             return
         from app.cine_table import track_meters
-        from app.control_run import ControlConfig, run_control, way1_clips
+        from app.control_run import ControlConfig, way1_clips
         from app.vehicle import VehicleModel
 
         pattern = self.patterns.get("way1")
@@ -303,6 +320,51 @@ class App(tk.Tk):
         model = VehicleModel.from_config(pattern.vehicle)
         config = ControlConfig()
         config.fusion.range_m = (pattern.r_min, pattern.r_max)
+        self._launch_control(clips, model, config, truth, out_dir)
+
+    def run_folder_control(self) -> None:
+        """Контрольный прогон любой записи: ролики и таблицы поз с любыми именами, в фоне."""
+        if getattr(self, "_control_thread", None) is not None and self._control_thread.is_alive():
+            messagebox.showinfo("Контрольный прогон", "Прогон уже идёт.")
+            return
+        from app.control_run import ControlConfig, scene_clips
+        from app.scene_folder import describe, safe_name, scan_folder, scene_truth
+        from app.vehicle import VehicleModel
+
+        pattern = self.patterns.get("way1")
+        if pattern is None or not pattern.vehicle:
+            messagebox.showerror("Контрольный прогон", "В config.yaml у профиля way1 нет блока vehicle.")
+            return
+        opened = getattr(self, "scene_folder", None)
+        folder = filedialog.askdirectory(
+            title="Папка с роликами и таблицами поз",
+            initialdir=str(opened.root) if opened is not None else str(ROOT),
+        )
+        if not folder:
+            return
+        try:
+            scene = scan_folder(Path(folder))
+            clips = scene_clips(scene)
+        except Exception as error:
+            messagebox.showerror("Контрольный прогон папки", f"Папка не разобралась: {error}")
+            return
+        if len(clips) < 2:
+            messagebox.showerror(
+                "Контрольный прогон папки",
+                "Для 3D нужны минимум 2 ролика с таблицами поз.\n\n" + describe(scene),
+            )
+            return
+        config = ControlConfig()
+        config.fusion.range_m = (pattern.r_min, pattern.r_max)
+        out_dir = ROOT / "reports" / f"{safe_name(scene.root.name)}_control"
+        self.status.configure(text=describe(scene))
+        self._launch_control(clips, VehicleModel.from_config(pattern.vehicle), config, scene_truth(scene), out_dir)
+
+    def _launch_control(self, clips, model, config, truth, out_dir: Path) -> None:
+        """Контрольный прогон в фоновом потоке; итог — окном из _watch_control."""
+        from app.control_run import run_control
+
+        self._control_out = out_dir
         self._control_note = "Контрольный прогон: старт…"
         self._control_result = None
 
@@ -330,7 +392,7 @@ class App(tk.Tk):
         if isinstance(result, Exception):
             messagebox.showerror("Контрольный прогон", str(result))
             return
-        lines = [f"Папка: {ROOT / 'reports' / 'way1_control'}"]
+        lines = [f"Папка: {getattr(self, '_control_out', ROOT / 'reports' / 'way1_control')}"]
         if result is not None and result.stats:
             stats = result.stats
             lines += [
@@ -338,6 +400,8 @@ class App(tk.Tk):
                 f"RMSE {stats['rmse_m']:.3f} м, медиана {stats['median_m']:.3f} м",
                 f"95% кадров точнее {stats['p95_m']:.3f} м, максимум {stats['max_m']:.3f} м",
             ]
+        if result is not None and result.files.get("xlsx") is not None:
+            lines.append(f"Excel: {Path(result.files['xlsx']).name}")
         messagebox.showinfo("Контрольный прогон", "\n".join(lines))
 
     def open_phone(self) -> None:
@@ -384,6 +448,61 @@ class App(tk.Tk):
         self.status.configure(
             text=f"{len(sources)} камер. След 3D — только триангуляция по кадрам."
         )
+
+    def open_scene_folder(self) -> None:
+        """Ролики любой записи: все видео папки, таблицы поз по именам. Позы есть — 3D, нет — 2D."""
+        from app.scene_folder import describe, scan_folder, scene_poses, video_motion_px
+
+        folder = filedialog.askdirectory(title="Папка с роликами (и таблицами поз, если есть)")
+        if not folder:
+            return
+        try:
+            scene = scan_folder(Path(folder))
+        except Exception as error:
+            messagebox.showerror("Папка с роликами", f"Папка не разобралась: {error}")
+            return
+        if not scene.cameras:
+            messagebox.showerror("Папка с роликами", describe(scene))
+            return
+        sources = []
+        for camera in scene.cameras:
+            source = VideoSource(str(camera.video), camera.camera_id)
+            if source.is_open():
+                sources.append(source)
+            else:
+                source.close()
+        if not sources:
+            messagebox.showerror("Папка с роликами", "Ни один ролик не открылся.")
+            return
+        self.auto_phone = False
+        self.focus = None
+        tables = scene_poses(scene)
+        if len(tables) >= 2:
+            # Позы двух и более камер: цель — машина, 3D-ящик по рамкам, как Way1.
+            pattern = self.patterns.get("way1")
+            if pattern is not None:
+                pattern.predict_s = self.profile.predict_s
+                self.profile = pattern
+                self.session.set_profile(pattern)
+            poses = {camera_id: table(0) for camera_id, table in tables.items()}
+            self.session.set_sources(sources, poses)
+            moving = {camera.camera_id for camera in scene.cameras if camera.moving or camera.turning}
+            self.session.set_pose_tables(tables, moving)
+        else:
+            # Без поз — 2D. Картинка гуляет (камера в руке или едет) — детектор с компенсацией движения.
+            shaky = any(video_motion_px(camera.video) > 1.5 for camera in scene.cameras)
+            if shaky and not self.profile.moving_camera:
+                profile = dataclasses.replace(self.profile, moving_camera=True)
+                self.profile = profile
+                self.session.set_profile(profile)
+            self.session.set_sources(sources)
+        # Не self.scene: это холст поля 3D (SceneCanvas).
+        self.scene_folder = scene
+        self.trails.clear()
+        self.zoom_state.clear()
+        self.status.configure(text=describe(scene))
+        if any(word in note for note in scene.notes for word in ("проверьте", "не прочиталась", "не открылся")):
+            messagebox.showwarning("Папка с роликами", describe(scene))
 
     def open_video(self) -> None:
         path = filedialog.askopenfilename(

@@ -161,5 +161,10 @@ def export_session_sample(session, out_dir: Path, max_frames: int = 120) -> dict
         )
     if times and xyz:
         result["csv"] = write_xyz_csv(times, xyz, out_dir / "xyz.csv")
+        from app.excel_export import table_from_csv, write_workbook
+
+        workbook = write_workbook(out_dir / "xyz.xlsx", [table_from_csv("Траектория", result["csv"])])
+        if workbook is not None:
+            result["xlsx"] = workbook
         result["charts"] = write_xyz_charts(times, xyz, out_dir / "xyz")
     return result

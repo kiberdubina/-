@@ -96,6 +96,7 @@ class Session:
         self.samples.clear()
         self.pose_root = None
         self.pose_tables = {}
+        self.moving_pose_ids = {"cam-5"}
         self.tracks3d = [Track3D(self.profile)]
         self.track3d = self.tracks3d[0]
         self.trail3d.clear()
