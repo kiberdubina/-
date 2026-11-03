@@ -417,7 +417,8 @@ class ObjectDetector:
 
     def _roi(self, width: int, height: int) -> tuple[int, int, int, int] | None:
         hint = self._state.hint
-        if hint is None:
+        # roi_scale ≤ 0 — всегда весь кадр: в потоке машин нужны все, а не одна.
+        if hint is None or self.spec.roi_scale <= 0:
             return None
         cx, cy, w, h = hint
         half_w = max(w * self.spec.roi_scale, ROI_MIN_PX) / 2.0

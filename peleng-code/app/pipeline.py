@@ -15,6 +15,8 @@ class Step:
     tracks: list[TrackView] | None = None
     # Цель по описанию: рамки модели с классом или запросом и уверенностью.
     labels: list[Label] | None = None
+    # Главный трек — машина, выбранная оператором (Shift+клик).
+    selected: bool = False
 
 
 class Pipeline:
@@ -73,4 +75,14 @@ class Pipeline:
         all_tracks = list(self.tracker.tracks)
         extra = all_tracks if len(all_tracks) > 1 else None
         labels = getattr(self.detector, "labels", None)
-        return Step(frame, self.tracker.accepted, track, extra, labels)
+        return Step(frame, self.tracker.accepted, track, extra, labels, self.tracker.has_target)
+
+    def select_at(self, x: float, y: float) -> bool:
+        """Оператор выбрал машину в точке кадра этой камеры."""
+        found = self.tracker.select_at(x, y)
+        if found:
+            self._last = None
+        return found
+
+    def clear_selection(self) -> None:
+        self.tracker.clear_selection()

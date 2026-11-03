@@ -7,7 +7,7 @@ import numpy as np
 
 from app.background import BackgroundConfig, RotatingBackground, StaticBackground, foreground_blobs
 from app.calib import BoardDetector, intrinsics_from_views, pose_from_view
-from app.geom import CameraPose, range_from_cameras, sight_rays, triangulate, velocity_in_camera
+from app.geom import CameraPose, _reprojection_error, range_from_cameras, sight_rays, triangulate, velocity_in_camera
 from app.motion import Detection
 from app.pipeline import Pipeline, Step
 from app.profile import TargetProfile
@@ -40,6 +40,13 @@ TRAIL_REJECT_LIMIT = 5    # столько выбросов подряд — э�
 TRAIL_COAST = 5           # столько кадров без измерения пишется прогноз фильтра
 
 
+# Выбранная машина на другой камере: трек берётся при невязке не больше MATCH_PICK_PX,
+# отпускается после MATCH_LOSE_FRAMES кадров подряд с невязкой больше MATCH_KEEP_PX.
+MATCH_PICK_PX = 50.0
+MATCH_KEEP_PX = 90.0
+MATCH_LOSE_FRAMES = 15
+
+
 @dataclass
 class Tick:
     steps: list[Step]
@@ -62,6 +69,9 @@ class Session:
         self.moving_pose_ids: set[str] = {"cam-5"}
         # Папка любой записи (app.scene_folder): поза каждой камеры по номеру кадра из её таблицы.
         self.pose_tables: dict = {}
+        # Машина, выбранная оператором: камера, где её выбрали, и счётчики несогласия других камер.
+        self.selection_camera: str | None = None
+        self._mismatch: dict[str, int] = {}
         self.tracks3d: list[Track3D] = [Track3D(profile)]
         self.track3d = self.tracks3d[0]
         self.trail3d: deque[np.ndarray] = deque(maxlen=4000)
@@ -104,6 +114,8 @@ class Session:
         self.pose_root = None
         self.pose_tables = {}
         self.moving_pose_ids = {"cam-5"}
+        self.selection_camera = None
+        self._mismatch = {}
         self.tracks3d = [Track3D(self.profile)]
         self.track3d = self.tracks3d[0]
         self.trail3d.clear()
@@ -117,6 +129,91 @@ class Session:
     def set_pose_source(self, root: Path | None) -> None:
         """Корень Way1 с CSV поз. После set_sources вызовите из use_way1(ROOT)."""
         self.pose_root = None if root is None else Path(root)
+
+    # ------------------------------------------------------------ выбранная машина
+
+    def select_target(self, camera_id: str, x: float, y: float) -> bool:
+        """Оператор выбрал машину в точке кадра камеры. Путь 3D начинается заново."""
+        pipeline = self._pipeline(camera_id)
+        if pipeline is None or not pipeline.select_at(x, y):
+            return False
+        for other in self.pipelines:
+            if other is not pipeline:
+                other.clear_selection()
+        self.selection_camera = camera_id
+        self._mismatch = {}
+        self.tracks3d = [Track3D(self.profile)]
+        self.track3d = self.tracks3d[0]
+        self.trail3d.clear()
+        self.trail_frames.clear()
+        self.target_id += 1
+        return True
+
+    def clear_target(self) -> None:
+        for pipeline in self.pipelines:
+            pipeline.clear_selection()
+        self.selection_camera = None
+        self._mismatch = {}
+
+    def selection_cameras(self) -> list[str]:
+        """Камеры, которые сейчас ведут выбранную машину."""
+        return [
+            getattr(pipeline.source, "camera_id", "")
+            for pipeline in self.pipelines
+            if pipeline.tracker.has_target
+        ]
+
+    def _pipeline(self, camera_id: str) -> Pipeline | None:
+        return next(
+            (pipeline for pipeline in self.pipelines if getattr(pipeline.source, "camera_id", None) == camera_id),
+            None,
+        )
+
+    def _match_selection(self, steps: list[Step]) -> None:
+        """Та же машина на других камерах: трек, чья точка сходится с выбранной по геометрии."""
+        if self.selection_camera is None:
+            return
+        by_id = {step.frame.camera_id: step for step in steps}
+        anchor = by_id.get(self.selection_camera)
+        pose_a = self.poses.get(self.selection_camera)
+        if anchor is None or pose_a is None or not anchor.selected:
+            return
+        pixel_a = (anchor.track.cx, anchor.track.cy)
+        for pipeline in self.pipelines:
+            camera_id = getattr(pipeline.source, "camera_id", None)
+            pose_b = self.poses.get(camera_id) if camera_id is not None else None
+            if camera_id == self.selection_camera or camera_id not in by_id or pose_b is None:
+                continue
+            tracker = pipeline.tracker
+            if tracker.has_target:
+                step = by_id[camera_id]
+                error = self._pair_error(pose_a, pixel_a, pose_b, (step.track.cx, step.track.cy))
+                bad = error is None or error > MATCH_KEEP_PX
+                self._mismatch[camera_id] = self._mismatch.get(camera_id, 0) + 1 if bad else 0
+                if self._mismatch[camera_id] < MATCH_LOSE_FRAMES:
+                    continue
+                # Долго не сходится с выбранной — это другая машина: ищем заново.
+                tracker.clear_selection()
+                self._mismatch[camera_id] = 0
+            best: tuple[float, int] | None = None
+            for index, view in enumerate(tracker.tracks):
+                if not view.active:
+                    continue
+                error = self._pair_error(pose_a, pixel_a, pose_b, (view.cx, view.cy))
+                if error is not None and error <= MATCH_PICK_PX and (best is None or error < best[0]):
+                    best = (error, index)
+            if best is not None:
+                tracker.select_index(best[1])
+
+    def _pair_error(self, pose_a: CameraPose, pixel_a, pose_b: CameraPose, pixel_b) -> float | None:
+        """Невязка репроекции точки по двум камерам, px. Точка вне дальности профиля — None."""
+        xyz = triangulate([pose_a, pose_b], [pixel_a, pixel_b], max_reproj_px=1e9)
+        if xyz is None:
+            return None
+        distance = range_from_cameras(xyz, [pose_a, pose_b])
+        if not (self.profile.r_min <= distance <= self.profile.r_max):
+            return None
+        return _reprojection_error([pose_a, pose_b], [pixel_a, pixel_b], xyz)
 
     def set_pose_tables(self, tables: dict, moving: set[str]) -> None:
         """Папка любой записи: поза камеры по кадру — tables[camera_id](frame). После set_sources.
@@ -157,6 +254,7 @@ class Session:
                 steps.append(step)
         if not steps:
             return None
+        self._match_selection(steps)
         world, rays = self._fuse(steps)
         if world.fresh and world.xyz is not None:
             self.trail3d.append(world.xyz.copy())
@@ -338,6 +436,9 @@ class Session:
         times = []
         for step in steps:
             if not step.track.measured or step.detection is None:
+                continue
+            # Выбрана машина: в 3D только камеры, которые ведут именно её.
+            if self.selection_camera is not None and not step.selected:
                 continue
             pose = self.poses.get(step.frame.camera_id)
             if pose is None:

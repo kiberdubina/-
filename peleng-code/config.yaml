@@ -1,4 +1,4 @@
-active: motion
+active: truck_text
 predict_s: 0.5
 board:
   squares_x: 5
@@ -150,3 +150,14 @@ patterns:
     mode: text
     query: ["truck", "cargo truck"]
     conf: 0.25
+  # Поток машин: детектор транспорта по всему кадру, Shift+клик в окне камеры — выбрать машину.
+  traffic:
+    mode: object
+    class: [car, truck, bus, motorcycle]
+    conf: 0.3
+    det_every: 2
+    det_width: 960
+    roi_scale: 0
+    r_min: 0.5
+    r_max: 500.0
+    v_max: 70.0
