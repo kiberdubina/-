@@ -229,7 +229,9 @@ class StaticBackground:
         self.model = _GaussianModel((self.size[1], self.size[0]), self.config)
         self.frames = 0
 
-    def apply(self, image: np.ndarray, pose=None) -> np.ndarray:
+    def apply(self, image: np.ndarray, pose=None, hold: np.ndarray | None = None) -> np.ndarray:
+        """hold — маска полного кадра, где по прогнозу стоит цель: там фон не учится.
+        Иначе цель, что едет на камеру и почти не меняет пиксели, уходит в фон «призраком»."""
         work = cv2.resize(image, self.size, interpolation=cv2.INTER_AREA).astype(np.float32)
         valid = np.ones(work.shape[:2], bool)
         model = self.model
@@ -237,9 +239,10 @@ class StaticBackground:
             foreground = np.zeros_like(valid)
         else:
             foreground = classify(work, model.mean, model.var, valid & model.seen, self.config)
+        learn = valid & ~_work_mask(hold, self.size)
         _GaussianModel.learn_arrays(
             self.config, model.mean, model.var, model.seen, model.age, model.last,
-            work, foreground, valid,
+            work, foreground, learn,
         )
         self.frames += 1
         return foreground
@@ -328,7 +331,8 @@ class RotatingBackground:
         self.model: _GaussianModel | None = None
         self.frames = 0
 
-    def apply(self, image: np.ndarray, pose) -> np.ndarray:
+    def apply(self, image: np.ndarray, pose, hold: np.ndarray | None = None) -> np.ndarray:
+        """hold — как у StaticBackground: где по прогнозу цель, панорама не учится."""
         if self.grid is None:
             self.grid = PanoramaGrid(self.width, self.height, self.config.work_width, pose)
             self.model = _GaussianModel((self.grid.rows, self.grid.cols), self.config)
@@ -354,6 +358,12 @@ class RotatingBackground:
             fg_patch = cv2.remap(
                 foreground.astype(np.uint8), u, v, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT
             ) > 0
+            held = _work_mask(hold, self.size)
+            if held.any():
+                held_patch = cv2.remap(
+                    held.astype(np.uint8), u, v, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT
+                ) > 0
+                covered = covered & ~held_patch
             # Окно может пересечь шов: работаем со столбцами по модулю.
             columns = np.arange(c0, c1) % grid.cols
             arrays = [model.mean, model.var, model.seen, model.age, model.last]
@@ -486,6 +496,13 @@ class RecordingBackground:
         work = cv2.resize(image, self.size, interpolation=cv2.INTER_AREA).astype(np.float32)
         mean, valid = self.background_for(pose)
         return classify(work, mean, self.config.init_sigma**2, valid, self.config)
+
+
+def _work_mask(hold: np.ndarray | None, size: tuple[int, int]) -> np.ndarray:
+    """Маска полного кадра → рабочий размер. Нет маски — пустая."""
+    if hold is None:
+        return np.zeros((size[1], size[0]), bool)
+    return cv2.resize(hold.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST) > 0
 
 
 def _same_rotation(first, second) -> bool:

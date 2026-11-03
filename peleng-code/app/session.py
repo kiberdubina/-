@@ -2,6 +2,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 from app.background import BackgroundConfig, RotatingBackground, StaticBackground, foreground_blobs
@@ -13,7 +14,7 @@ from app.profile import TargetProfile
 from app.rig import Rig, RigCamera
 from app.track2d import TrackView
 from app.track3d import Track3D, WorldView
-from app.vehicle import V, VehicleModel, anchor_point, ctrv_step, state_axes
+from app.vehicle import V, VehicleModel, anchor_point, box_corners, ctrv_step, project_points, state_axes
 from app.vehicle_fusion import CameraView, FusionConfig, VehicleFusion
 
 # Два кадра дальше этого зазора — разные положения цели. Такую пару не триангулируем.
@@ -21,6 +22,8 @@ PAIR_SYNC_S = 0.08
 MAX_TRACKS3D = 4
 # Живой режим машины: фон считается на кадре этой ширины (быстрее, чем в контрольном прогоне).
 LIVE_WORK_WIDTH = 480
+# Запас вокруг проекции прогнозного ящика, где живой фон не учится, px полного кадра.
+HOLD_PAD_PX = 30
 
 
 @dataclass
@@ -49,6 +52,8 @@ class Session:
         self.target_id = 1
         self.vehicle: VehicleFusion | None = None
         self.backgrounds: dict[str, StaticBackground | RotatingBackground] = {}
+        # Последнее состояние 3D-ящика и его время: прогноз маски, где фон не учится.
+        self._held: tuple[np.ndarray, float] | None = None
         self._setup_vehicle()
         self.set_sources([source])
 
@@ -67,6 +72,7 @@ class Session:
         self.trail3d.clear()
         self.trail_frames.clear()
         self.backgrounds.clear()
+        self._held = None
         self._setup_vehicle()
         for pipeline in self.pipelines:
             pipeline.set_profile(profile)
@@ -82,6 +88,7 @@ class Session:
         self.trail3d.clear()
         self.trail_frames.clear()
         self.backgrounds.clear()
+        self._held = None
         if self.vehicle is not None:
             self.vehicle.reset()
 
@@ -151,13 +158,14 @@ class Session:
             if getattr(pipeline.source, "rewound", False):
                 self.backgrounds.pop(frame.camera_id, None)
                 self.vehicle.reset()
+                self._held = None
             self._refresh_pose(pipeline, frame)
             frames.append(frame)
             pose = self.poses.get(frame.camera_id)
             if pose is None:
                 continue
             background = self._background(frame.camera_id, frame.image)
-            mask = background.apply(frame.image, pose)
+            mask = background.apply(frame.image, pose, self._hold_mask(pose, frame.time_s))
             views[frame.camera_id] = CameraView(pose, foreground_blobs(mask, background.scale))
         if not frames:
             return None
@@ -166,8 +174,10 @@ class Session:
         view = self.vehicle.step(time_s, views, key=key)
         steps = [self._vehicle_step(frame, view.observed.get(frame.camera_id)) for frame in frames]
         if not view.active or view.state is None:
+            self._held = None
             return Tick(steps, WorldView(False, None, 0.0, None), list(self.trail3d))
         state = view.state
+        self._held = (np.array(state, np.float64, copy=True), time_s)
         model = self.vehicle.model
         anchor = anchor_point(state, model)
         motion = self.vehicle.motion
@@ -182,6 +192,22 @@ class Session:
             if key is not None:
                 self.trail_frames.append((int(key), anchor.copy()))
         return Tick(steps, world, list(self.trail3d), [], view.corners)
+
+    def _hold_mask(self, pose: CameraPose, time_s: float) -> np.ndarray | None:
+        """Проекция прогнозного 3D-ящика на кадр камеры с запасом: там цель, фон не учится."""
+        if self._held is None or self.vehicle is None:
+            return None
+        state, last_s = self._held
+        motion = self.vehicle.motion
+        ahead = ctrv_step(state, max(0.0, time_s - last_s), motion.yaw_tau_s, motion.pitch_tau_s)
+        pixels, depth = project_points(pose, box_corners(ahead, self.vehicle.model))
+        if float(depth.min()) <= 0.5:
+            return None
+        hull = cv2.convexHull(pixels.astype(np.float32)).astype(np.int32)
+        mask = np.zeros((pose.height, pose.width), np.uint8)
+        cv2.fillConvexPoly(mask, hull, 1)
+        size = 2 * HOLD_PAD_PX + 1
+        return cv2.dilate(mask, np.ones((size, size), np.uint8)) > 0
 
     def _vehicle_step(self, frame, bbox) -> Step:
         """Шаг камеры для окна: рамка — силуэт, вошедший в измерение 3D-ящика."""
