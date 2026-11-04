@@ -120,8 +120,11 @@ class SceneCanvas(tk.Canvas):
         hint: str,
         rays: list[tuple[np.ndarray, np.ndarray]] | None = None,
         box: np.ndarray | None = None,
+        path: np.ndarray | None = None,
     ) -> None:
         self.box = None if box is None else np.asarray(box, np.float64).reshape(8, 3).copy()
+        # Прогноз траектории до горизонта (WorldView.path); нет — прямой отрезок до pred.
+        self.path = None if path is None else np.asarray(path, np.float64).reshape(-1, 3).copy()
         self.trail = [np.asarray(point, np.float64).reshape(3).copy() for point in trail]
         self.current = None if current is None else np.asarray(current, np.float64).reshape(3).copy()
         self.pred = None if pred is None else np.asarray(pred, np.float64).reshape(3).copy()
@@ -348,7 +351,11 @@ class SceneCanvas(tk.Canvas):
                 "trail",
             )
         if self.current is not None and self.pred is not None:
-            segment = np.stack([self.current, self.pred], axis=0)
+            path = getattr(self, "path", None)
+            if path is not None and len(path):
+                segment = np.vstack([self.current.reshape(1, 3), path])
+            else:
+                segment = np.stack([self.current, self.pred], axis=0)
             self._polyline(
                 self._project(segment, target, distance, width, height),
                 "#3ec6e0",

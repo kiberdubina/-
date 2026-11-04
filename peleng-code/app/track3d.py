@@ -7,6 +7,9 @@ from app.geom import CameraPose, range_from_cameras, velocity_in_camera
 from app.profile import TargetProfile
 
 
+FORECAST_POINTS = 10
+
+
 @dataclass
 class WorldView:
     active: bool
@@ -15,6 +18,8 @@ class WorldView:
     pred: np.ndarray | None
     relative: dict[str, np.ndarray] = field(default_factory=dict)
     fresh: bool = False
+    # Прогноз траектории: FORECAST_POINTS точек от «сейчас» до горизонта профиля (последняя = pred).
+    path: np.ndarray | None = None
 
 
 class Track3D:
@@ -105,8 +110,10 @@ class Track3D:
         velocity = state[3:].astype(np.float64)
         speed = float(np.linalg.norm(velocity))
         pred = xyz + velocity * self.profile.predict_s
+        steps = np.linspace(1.0, FORECAST_POINTS, FORECAST_POINTS) / FORECAST_POINTS * self.profile.predict_s
+        path = xyz + steps[:, None] * velocity
         relative = {}
         if poses:
             for camera_id, pose in poses.items():
                 relative[camera_id] = velocity_in_camera(velocity, pose)
-        return WorldView(True, xyz, speed, pred, relative, fresh)
+        return WorldView(True, xyz, speed, pred, relative, fresh, path)

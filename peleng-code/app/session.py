@@ -5,7 +5,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from app.background import BackgroundConfig, RotatingBackground, StaticBackground, foreground_blobs
+from app.background import BackgroundConfig, Blob, RotatingBackground, StaticBackground, foreground_blobs
 from app.calib import BoardDetector, intrinsics_from_views, pose_from_view
 from app.geom import CameraPose, _reprojection_error, range_from_cameras, sight_rays, triangulate, velocity_in_camera
 from app.motion import Detection
@@ -13,7 +13,7 @@ from app.pipeline import Pipeline, Step
 from app.profile import TargetProfile
 from app.rig import Rig, RigCamera
 from app.track2d import TrackView
-from app.track3d import Track3D, WorldView
+from app.track3d import FORECAST_POINTS, Track3D, WorldView
 from app.vehicle import V, VehicleModel, anchor_point, box_corners, ctrv_step, project_points, state_axes
 from app.vehicle_fusion import CameraView, FusionConfig, VehicleFusion
 
@@ -49,11 +49,22 @@ MATCH_LOSE_FRAMES = 8
 # проекции, не дальше max(MATCH_NEAR_PX, 0,6 · размер рамки). Нет точки — по лучу, но только если
 # лучший кандидат в MATCH_UNIQUE раз лучше второго: на перекрёстке вдоль луча стоит очередь машин.
 MATCH_REF_S = 1.0
+# Камера «едет», если её центр ушёл от первой позы дальше этого, м: фон по ней не строится.
+TRANSLATE_M = 0.5
 MATCH_NEAR_PX = 30.0
 MATCH_UNIQUE = 2.0
 # Двусмысленность по лучу копится по кадрам (машины едут по-разному, чужая уходит с луча);
 # не разрешилась за MATCH_SETTLE кадров — берётся лучший по средней невязке.
 MATCH_SETTLE = 8
+
+
+def vehicle_forecast(state: np.ndarray, model: VehicleModel, motion, horizon_s: float) -> np.ndarray:
+    """Прогноз траектории машины: FORECAST_POINTS точек опорной точки до горизонта по её модели
+    движения (дуга с поворотом и уклоном, как у фильтра). Последняя — прогноз на горизонт."""
+    return np.stack([
+        anchor_point(ctrv_step(state, horizon_s * k / FORECAST_POINTS, motion.yaw_tau_s, motion.pitch_tau_s), model)
+        for k in range(1, FORECAST_POINTS + 1)
+    ])
 
 
 def project_point(pose: CameraPose, xyz: np.ndarray) -> tuple[float, float] | None:
@@ -91,6 +102,11 @@ class Session:
         self._mismatch: dict[str, int] = {}
         self._selection_ref: tuple[np.ndarray, float] | None = None
         self._evidence: dict[str, dict] = {}
+        # Детектор грузовика по камерам для режима машины (vehicle.detector в профиле); False — не собрался.
+        self._truck_detectors: dict[str, object] = {}
+        # Камеры, которые едут (центр ушёл от первой позы): у них пятна только от детектора.
+        self._first_centers: dict[str, np.ndarray] = {}
+        self._translating: set[str] = set()
         self.tracks3d: list[Track3D] = [Track3D(profile)]
         self.track3d = self.tracks3d[0]
         self.trail3d: deque[np.ndarray] = deque(maxlen=4000)
@@ -120,6 +136,9 @@ class Session:
         self.trail3d.clear()
         self.trail_frames.clear()
         self.backgrounds.clear()
+        self._truck_detectors = {}
+        self._first_centers = {}
+        self._translating = set()
         self._held = None
         self._setup_vehicle()
         for pipeline in self.pipelines:
@@ -372,9 +391,15 @@ class Session:
             pose = self.poses.get(frame.camera_id)
             if pose is None:
                 continue
-            background = self._background(frame.camera_id, frame.image)
-            mask = background.apply(frame.image, pose, self._hold_mask(pose, frame.time_s))
-            views[frame.camera_id] = CameraView(pose, foreground_blobs(mask, background.scale))
+            detected = self._truck_blobs(frame)
+            if self._detector_only(frame.camera_id, pose) and self._truck_detectors.get(frame.camera_id):
+                # Едущая камера (или профиль «только детектор»): фон с параллаксом только мешает.
+                blobs = detected
+            else:
+                background = self._background(frame.camera_id, frame.image)
+                mask = background.apply(frame.image, pose, self._hold_mask(pose, frame.time_s))
+                blobs = foreground_blobs(mask, background.scale) + detected
+            views[frame.camera_id] = CameraView(pose, blobs)
         if not frames:
             return None
         time_s = max(frame.time_s for frame in frames)
@@ -390,12 +415,11 @@ class Session:
         model = self.vehicle.model
         anchor = anchor_point(state, model)
         motion = self.vehicle.motion
-        ahead = anchor_point(
-            ctrv_step(state, self.profile.predict_s, motion.yaw_tau_s, motion.pitch_tau_s), model
-        )
+        path = vehicle_forecast(state, model, motion, float(self.profile.predict_s))
+        ahead = path[-1]
         velocity = float(state[V]) * state_axes(state)[0]
         relative = {camera_id: velocity_in_camera(velocity, pose) for camera_id, pose in self.poses.items()}
-        world = WorldView(True, anchor, view.speed_m_s, ahead, relative, view.fresh)
+        world = WorldView(True, anchor, view.speed_m_s, ahead, relative, view.fresh, path)
         sigma = None if view.sigma_m is None else SIGMA_SCALE * view.sigma_m
         if self._trail_accept(key, anchor, view.fresh, len(view.observed), sigma):
             self.trail3d.append(anchor.copy())
@@ -448,6 +472,43 @@ class Session:
         cv2.fillConvexPoly(mask, hull, 1)
         size = 2 * HOLD_PAD_PX + 1
         return cv2.dilate(mask, np.ones((size, size), np.uint8)) > 0
+
+    def _detector_only(self, camera_id: str, pose: CameraPose) -> bool:
+        """Профиль «только детектор» или камера уже сдвинулась больше TRANSLATE_M от первой позы."""
+        if (self.profile.vehicle or {}).get("detector_mode") == "detector":
+            return True
+        rotation, _ = cv2.Rodrigues(pose.rvec)
+        center = (-rotation.T @ pose.tvec).ravel()
+        first = self._first_centers.setdefault(camera_id, center)
+        if float(np.linalg.norm(center - first)) > TRANSLATE_M:
+            self._translating.add(camera_id)
+        return camera_id in self._translating
+
+    def _truck_blobs(self, frame) -> list[Blob]:
+        """Рамки детектора грузовика (vehicle.detector в профиле) как пятна для подгонки ящика."""
+        spec = self.profile.vehicle or {}
+        if not spec.get("detector") or spec.get("detector_mode", "both") == "background":
+            return []
+        detector = self._truck_detectors.get(frame.camera_id)
+        if detector is None:
+            from app.object_detector import DetectorError, ObjectDetector, parse_spec
+
+            # Без порогов площади профиля: близкий грузовик крупнее s_max профиля way1.
+            wide = TargetProfile("truck_detector", 0.0, 1e12, 0.0, 1e9, 0.0, 1e9, 0.0, 1e9, None, 0.5, None)
+            try:
+                detector = ObjectDetector(wide, parse_spec({
+                    "mode": "object", "class": "truck", "model": str(spec["detector"]), "conf": 0.25,
+                    "det_every": 1, "det_width": 960, "roi_scale": 0,
+                }))
+            except DetectorError:
+                detector = False
+            self._truck_detectors[frame.camera_id] = detector
+        if detector is False:
+            return []
+        return [
+            Blob(float(x), float(y), float(w), float(h), float(w * h))
+            for x, y, w, h in (item.bbox for item in detector.detect(frame.image))
+        ]
 
     def _vehicle_step(self, frame, bbox) -> Step:
         """Шаг камеры для окна: рамка — силуэт, вошедший в измерение 3D-ящика."""

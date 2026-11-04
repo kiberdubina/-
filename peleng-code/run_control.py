@@ -27,6 +27,10 @@ def main() -> int:
     parser.add_argument("--passes", type=int, default=2)
     parser.add_argument("--workers", type=int, default=5)
     parser.add_argument("--folder", help="папка с роликами и таблицами поз любой записи")
+    parser.add_argument("--detector", help="веса детектора грузовика (.pt); по умолчанию — из профиля way1")
+    parser.add_argument("--detector-mode", choices=("background", "detector", "both"),
+                        help="источник пятен: фон, детектор или оба (по умолчанию — из профиля или фон)")
+    parser.add_argument("--detector-conf", type=float, default=0.25)
     args = parser.parse_args()
 
     profile = load_patterns(ROOT / "config.yaml")["way1"]
@@ -52,6 +56,10 @@ def main() -> int:
         truth = track_meters(ROOT)
     config = ControlConfig(passes=args.passes, workers=args.workers)
     config.fusion.range_m = (profile.r_min, profile.r_max)
+    from app.control_run import apply_detector
+
+    config.detector_conf = args.detector_conf
+    print(apply_detector(config, profile.vehicle, args.detector, args.detector_mode))
     started = time.perf_counter()
     last = [""]
 
