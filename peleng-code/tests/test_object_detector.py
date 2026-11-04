@@ -218,6 +218,30 @@ class CoordinatesTest(unittest.TestCase):
         self.assertEqual([item.bbox for item in found], [(20, 20, 5, 5), (50, 50, 40, 40), (0, 0, 10, 10)])
 
 
+class MergeTest(unittest.TestCase):
+    def test_cab_and_trailer_become_one_box(self):
+        # Кабина и прицеп рядом, третья машина далеко — она остаётся отдельной.
+        model = FakeModel([
+            (0.10, 0.40, 0.25, 0.60, 0.8, "truck"),
+            (0.26, 0.38, 0.60, 0.62, 0.6, "truck"),
+            (0.85, 0.10, 0.95, 0.20, 0.7, "truck"),
+        ])
+        spec = parse_spec({"mode": "object", "class": "truck", "merge": True})
+        detector = ObjectDetector(_profile(), spec, model=model)
+        found = detector.detect(np.zeros((100, 100, 3), np.uint8))
+        self.assertEqual([item.bbox for item in found], [(10, 38, 50, 24), (85, 10, 10, 10)])
+        self.assertAlmostEqual(detector.labels[0].conf, 0.8)
+
+    def test_without_merge_boxes_stay_apart(self):
+        model = FakeModel([
+            (0.10, 0.40, 0.25, 0.60, 0.8, "truck"),
+            (0.26, 0.38, 0.60, 0.62, 0.6, "truck"),
+        ])
+        spec = parse_spec({"mode": "object", "class": "truck"})
+        detector = ObjectDetector(_profile(), spec, model=model)
+        self.assertEqual(len(detector.detect(np.zeros((100, 100, 3), np.uint8))), 2)
+
+
 class ScheduleTest(unittest.TestCase):
     def test_model_runs_every_n_frames(self):
         model = FakeModel()

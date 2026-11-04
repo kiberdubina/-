@@ -14,7 +14,6 @@ import threading
 import time
 from pathlib import Path
 
-import av
 import cv2
 import numpy as np
 
@@ -462,10 +461,26 @@ def _length_prefixed(payload: bytes, length_size: int) -> bytes:
     return bytes(out)
 
 
+def _pyav():
+    """PyAV — только для кадров телефона, поэтому грузится при подключении, а не при импорте.
+
+    PyAV везёт свою копию FFmpeg, OpenCV — свою. В одном процессе на macOS обе libavdevice
+    объявляют классы AVFFrameReceiver и AVFAudioReceiver (устройство захвата avfoundation),
+    и рантайм Objective-C предупреждает о двойной реализации. Ни OpenCV (файлы и потоки),
+    ни декодер H.264 здесь это устройство не используют. Без телефона вторая копия не грузится.
+    """
+    try:
+        import av
+    except ImportError as error:
+        raise OSError("Нет пакета av для картинки телефона: pip install -r requirements.txt") from error
+    return av
+
+
 class _H264Decoder:
     """Один декодер. Наружу отдаётся только что разобранный кадр, без очереди."""
 
     def __init__(self) -> None:
+        av = _pyav()
         self._context = av.CodecContext.create("h264", "r")
         self._context.thread_count = 1
         self._context.thread_type = av.codec.context.ThreadType.SLICE
@@ -482,7 +497,7 @@ class _H264Decoder:
             for packet in self._context.parse(annex):
                 for frame in self._context.decode(packet):
                     latest = frame.to_ndarray(format="bgr24")
-        except av.FFmpegError:
+        except _pyav().FFmpegError:
             return None
         return latest
 
@@ -551,6 +566,8 @@ class PhonePreviewSource:
         return not self._closed
 
     def _start(self) -> None:
+        # Декодер понадобится в потоке кадров: нет PyAV — понятная ошибка сейчас, а не там.
+        _pyav()
         self._power_stayon("usb")
         if not _cable_accepts_camera(self.serial):
             raise OSError(FILE_TRANSFER_REQUIRED)
@@ -978,7 +995,7 @@ class PhonePreviewSource:
                     continue
                 self._fail("Кабель на месте, камера телефона не открылась. Разблокируйте экран.")
                 return
-            except (EOFError, OSError, av.FFmpegError) as exc:
+            except (EOFError, OSError, _pyav().FFmpegError) as exc:
                 if self._stop.is_set() or self._closed:
                     self._release_stream()
                     return

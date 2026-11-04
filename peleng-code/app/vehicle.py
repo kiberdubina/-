@@ -435,6 +435,9 @@ class VehicleTracker:
     reverse_m_s: float = 1.0
     # Сколько секунд подряд нужна уверенная езда «задом», чтобы развернуть гипотезу.
     reverse_hold_s: float = 0.3
+    # Уклон дороги не круче этого. По одной камере дальность не измерена, и без предела
+    # ящик уходит вдоль луча под землю, кувыркаясь (Way2: тангаж до −166°, глубина −120 м).
+    max_pitch_rad: float = float(np.radians(20.0))
     state: np.ndarray | None = None
     covariance: np.ndarray | None = None
     time_s: float | None = None
@@ -496,6 +499,8 @@ class VehicleTracker:
         else:
             self.state, self.covariance = result.state, result.covariance
             self.misses = 0
+        self.state = self.state.copy()
+        self.state[THETA] = float(np.clip(self.state[THETA], -self.max_pitch_rad, self.max_pitch_rad))
         self.time_s = float(time_s)
         self.history.append(
             TrackRecord(

@@ -126,6 +126,23 @@ def compare_by_frame(
     return stats
 
 
+def error_summary(errors: np.ndarray) -> dict:
+    """RMSE, средняя (MAE), медиана, P95 и максимум евклидовой ошибки; NaN не считаются."""
+    errors = np.asarray(errors, np.float64).reshape(-1)
+    errors = errors[np.isfinite(errors)]
+    if errors.size == 0:
+        nan = float("nan")
+        return {"frames": 0, "rmse_m": nan, "mae_m": nan, "median_m": nan, "p95_m": nan, "max_m": nan}
+    return {
+        "frames": int(errors.size),
+        "rmse_m": float(np.sqrt(np.mean(errors**2))),
+        "mae_m": float(np.mean(errors)),
+        "median_m": float(np.median(errors)),
+        "p95_m": float(np.percentile(errors, 95)),
+        "max_m": float(np.max(errors)),
+    }
+
+
 def frame_errors(frames: list[int] | np.ndarray, est: np.ndarray, truth: np.ndarray) -> np.ndarray:
     """Евклидова ошибка на каждом кадре (NaN, если кадра нет в таблице)."""
     frames = np.asarray(frames, dtype=np.int64).reshape(-1)

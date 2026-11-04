@@ -12,7 +12,7 @@ from app.motion import Detection
 from app.pipeline import Pipeline, Step
 from app.profile import TargetProfile
 from app.rig import Rig, RigCamera
-from app.track2d import TrackView
+from app.track2d import CenterHistory, TrackView
 from app.track3d import FORECAST_POINTS, Track3D, WorldView
 from app.vehicle import V, VehicleModel, anchor_point, box_corners, ctrv_step, project_points, state_axes
 from app.vehicle_fusion import CameraView, FusionConfig, VehicleFusion
@@ -104,6 +104,8 @@ class Session:
         self._evidence: dict[str, dict] = {}
         # Детектор грузовика по камерам для режима машины (vehicle.detector в профиле); False — не собрался.
         self._truck_detectors: dict[str, object] = {}
+        # След центра рамки по камерам в режиме 3D-ящика: вектор скорости и прогноз в окне.
+        self._center_history: dict[str, CenterHistory] = {}
         # Камеры, которые едут (центр ушёл от первой позы): у них пятна только от детектора.
         self._first_centers: dict[str, np.ndarray] = {}
         self._translating: set[str] = set()
@@ -137,6 +139,7 @@ class Session:
         self.trail_frames.clear()
         self.backgrounds.clear()
         self._truck_detectors = {}
+        self._center_history = {}
         self._first_centers = {}
         self._translating = set()
         self._held = None
@@ -337,8 +340,14 @@ class Session:
         if close is not None:
             close()
 
+    @property
+    def box_mode(self) -> bool:
+        """3D — подгонка ящика машины по рамкам камер (в профиле габарит, позы у двух камер и больше).
+        Иначе — триангуляция центров 2D-треков."""
+        return self.vehicle is not None and len(self.poses) >= 2
+
     def step(self) -> Tick | None:
-        if self.vehicle is not None and len(self.poses) >= 2:
+        if self.box_mode:
             return self._step_vehicle()
         steps: list[Step] = []
         for pipeline in self.pipelines:
@@ -388,10 +397,12 @@ class Session:
                 self._trail_reset()
             self._refresh_pose(pipeline, frame)
             frames.append(frame)
-            pose = self.poses.get(frame.camera_id)
-            if pose is None:
-                continue
-            detected = self._truck_blobs(frame)
+        posed = [frame for frame in frames if self.poses.get(frame.camera_id) is not None]
+        # Рамки всех камер — одним прогоном сети: на GPU это быстрее, чем камера за камерой.
+        truck_blobs = self._truck_blobs(posed)
+        for frame in posed:
+            pose = self.poses[frame.camera_id]
+            detected = truck_blobs.get(frame.camera_id, [])
             if self._detector_only(frame.camera_id, pose) and self._truck_detectors.get(frame.camera_id):
                 # Едущая камера (или профиль «только детектор»): фон с параллаксом только мешает.
                 blobs = detected
@@ -484,12 +495,31 @@ class Session:
             self._translating.add(camera_id)
         return camera_id in self._translating
 
-    def _truck_blobs(self, frame) -> list[Blob]:
-        """Рамки детектора грузовика (vehicle.detector в профиле) как пятна для подгонки ящика."""
+    def _truck_blobs(self, frames: list) -> dict[str, list[Blob]]:
+        """Рамки детектора грузовика (vehicle.detector в профиле) как пятна для подгонки ящика.
+
+        Все камеры кадра — одним вызовом detect_batch; рамки те же, что у detect по камерам.
+        """
         spec = self.profile.vehicle or {}
         if not spec.get("detector") or spec.get("detector_mode", "both") == "background":
-            return []
-        detector = self._truck_detectors.get(frame.camera_id)
+            return {}
+        from app.object_detector import detect_batch
+
+        items = []
+        for frame in frames:
+            detector = self._truck_detector(frame.camera_id, str(spec["detector"]))
+            if detector:
+                items.append((frame.camera_id, detector, frame.image))
+        found = detect_batch([(detector, image) for _, detector, image in items])
+        return {
+            camera_id: [Blob(float(x), float(y), float(w), float(h), float(w * h)) for x, y, w, h in
+                        (item.bbox for item in detections)]
+            for (camera_id, _, _), detections in zip(items, found)
+        }
+
+    def _truck_detector(self, camera_id: str, weights: str):
+        """Детектор грузовика камеры, собранный при первом кадре; False — веса или ultralytics не загрузились."""
+        detector = self._truck_detectors.get(camera_id)
         if detector is None:
             from app.object_detector import DetectorError, ObjectDetector, parse_spec
 
@@ -497,31 +527,34 @@ class Session:
             wide = TargetProfile("truck_detector", 0.0, 1e12, 0.0, 1e9, 0.0, 1e9, 0.0, 1e9, None, 0.5, None)
             try:
                 detector = ObjectDetector(wide, parse_spec({
-                    "mode": "object", "class": "truck", "model": str(spec["detector"]), "conf": 0.25,
+                    "mode": "object", "class": "truck", "model": weights, "conf": 0.25,
                     "det_every": 1, "det_width": 960, "roi_scale": 0,
                 }))
             except DetectorError:
                 detector = False
-            self._truck_detectors[frame.camera_id] = detector
-        if detector is False:
-            return []
-        return [
-            Blob(float(x), float(y), float(w), float(h), float(w * h))
-            for x, y, w, h in (item.bbox for item in detector.detect(frame.image))
-        ]
+            self._truck_detectors[camera_id] = detector
+        return detector
 
     def _vehicle_step(self, frame, bbox) -> Step:
-        """Шаг камеры для окна: рамка — силуэт, вошедший в измерение 3D-ящика."""
+        """Шаг камеры для окна: рамка — силуэт, вошедший в измерение 3D-ящика.
+
+        След прошлых центров, вектор скорости и прогноз — по центрам рамки этой камеры.
+        """
         horizon = float(self.profile.predict_s)
+        history = self._center_history.setdefault(frame.camera_id, CenterHistory())
         if bbox is None:
             idle = TrackView(False, 0.0, 0.0, 0.0, 0.0, 0.0, "поиск", False, False,
-                             0.0, 0.0, None, None, None, (), horizon)
+                             0.0, 0.0, None, None, None, history.trail(), horizon)
             return Step(frame, None, idle)
         x, y, w, h = (int(round(value)) for value in bbox)
         cx, cy = x + 0.5 * w, y + 0.5 * h
+        history.add(cx, cy, frame.time_s)
+        vx, vy = history.velocity()
+        dx, dy = vx * horizon, vy * horizon
+        pred_bbox = (int(round(x + dx)), int(round(y + dy)), w, h)
         detection = Detection(cx, cy, float(w * h), (x, y, w, h))
-        track = TrackView(True, cx, cy, 0.0, 0.0, 0.0, "сопровождение", True, True,
-                          cx, cy, (x, y, w, h), None, float(w * h), (), horizon)
+        track = TrackView(True, cx, cy, vx, vy, float(np.hypot(vx, vy)), "сопровождение", True, True,
+                          cx + dx, cy + dy, (x, y, w, h), pred_bbox, float(w * h), history.trail(), horizon)
         return Step(frame, detection, track)
 
     def snap_board(self, detector: BoardDetector, frames: list) -> list[str]:
