@@ -134,6 +134,31 @@ patterns:
       # Нет файла весов — только фон.
       detector: models/truck_world.pt
       detector_mode: both
+  # Way2 (папка scene2): тот же грузовик CargoTruck.fbx (габарит как у way1), снег и пыль.
+  # Пятна фона там ловят снежинки — только рамки детектора. truck_world_top.pt — YOLO-World x
+  # с запросами «грузовик сверху» (собирается _make_truck_world_top.py): видит и дрон cam-2.
+  # Опорная точка — центр ящика на земле.
+  way2:
+    s_min: 40.0
+    s_max: 120000.0
+    u_min: 1.0
+    u_max: 8000.0
+    r_min: 1.0
+    r_max: 600.0
+    v_min: 0.05
+    v_max: 120.0
+    d_m: null
+    color: null
+    moving_camera: false
+    require_motion: false
+    vehicle:
+      front_m: 14.12
+      rear_m: -5.54
+      width_m: 5.13
+      height_m: 6.43
+      anchor_m: [4.29, 0.0, 0.0]
+      detector: models/truck_world_top.pt
+      detector_mode: detector
   # Цель по описанию (app/object_detector.py, нужен requirements-detect.txt и веса в models/).
   # s_*/u_*/r_*/v_* можно не задавать: отбор делает модель. Площадь — площадь рамки.
   black_hoodie_person:

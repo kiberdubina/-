@@ -1,6 +1,7 @@
 import dataclasses
 import sys
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
@@ -202,6 +203,47 @@ def tile_to_image(
         return None
     x0, y0, x1, y1 = crop if crop is not None else (0, 0, frame_w, frame_h)
     return x0 + u * (x1 - x0), y0 + v * (y1 - y0)
+
+
+# Самая короткая пауза между кадрами: окно успевает обработать клики и клавиши,
+# даже когда кадр считается дольше периода.
+MIN_TICK_GAP_MS = 5
+
+
+def next_tick_delay(period_ms: int, spent_ms: float) -> int:
+    """Пауза до следующего кадра: период минус время, ушедшее на этот кадр, но не меньше MIN_TICK_GAP_MS."""
+    return max(MIN_TICK_GAP_MS, int(round(period_ms - spent_ms)))
+
+
+def three_d_note(session) -> str:
+    """Как сейчас считаются метры — по той же развилке, что Session.step."""
+    with_pose = len(session.poses)
+    if session.box_mode:
+        spec = session.profile.vehicle or {}
+        mode = spec.get("detector_mode", "both") if spec.get("detector") else "background"
+        source = {
+            "background": "пятна фона",
+            "detector": "рамки детектора грузовика",
+        }.get(mode, "пятна фона и рамки детектора грузовика")
+        return (
+            f"3D — ящик машины по рамкам {with_pose} камер ({source}), фильтр CTRV + EKF. "
+            "В след — точки, где цель видят две камеры."
+        )
+    if with_pose >= 2:
+        return f"3D — триангуляция центра цели по камерам с позами ({with_pose})."
+    return "Только 2D — для метров нужны две камеры с позами."
+
+
+def truck_detector_note(session) -> str | None:
+    """Детектор грузовика режима 3D-ящика — тот, что даёт рамки (детектор конвейера там не работает)."""
+    loaded = [item for item in getattr(session, "_truck_detectors", {}).values() if item]
+    if not loaded:
+        return None
+    spec = loaded[0].spec
+    return (
+        f"детектор грузовика: {Path(spec.model).name}   {loaded[0].device}   "
+        f"{max(item.ms for item in loaded):.0f} мс на кадр камеры, порог {spec.conf:g}, {spec.det_width} px"
+    )
 
 
 class App(tk.Tk):
@@ -752,7 +794,7 @@ class App(tk.Tk):
         self.session.set_pose_source(ROOT)
         self.trails.clear()
         self.zoom_state.clear()
-        self.notify(f"{len(sources)} камер. След 3D — только триангуляция по кадрам.")
+        self.notify(three_d_note(self.session))
 
     def open_scene_folder(self) -> None:
         """Ролики любой записи: все видео папки, таблицы поз по именам. Позы есть — 3D, нет — 2D."""
@@ -1036,7 +1078,7 @@ class App(tk.Tk):
 
     def select_vehicle(self, camera_id: str, px: float, py: float) -> None:
         """Shift+клик по машине в окне камеры: следить за ней на всех камерах."""
-        if self.session.vehicle is not None and len(self.session.poses) >= 2:
+        if self.session.box_mode:
             self.notify("Режим 3D-ящика ведёт одну цель сам. Для выбора машины — «Цель → Транспорт».", warn=True)
             return
         geom = self._tile_geom.get(camera_id)
@@ -1159,6 +1201,7 @@ class App(tk.Tk):
         self._schedule_phone_scan()
 
     def tick(self) -> None:
+        started = time.perf_counter()
         # На паузе кадры не берутся: видео стоит, картинка и след замирают.
         alive = None if self.paused else self.session.step()
         stuck = self._release_stuck_phone()
@@ -1174,7 +1217,9 @@ class App(tk.Tk):
         elif self._notice and int(self.tk.call("clock", "milliseconds")) > self._notice_until:
             self._notice = ""
             self.status.configure(text="")
-        self.after(self._tick_delay(), self.tick)
+        # Период кадра отсчитывается от начала тика: время детекции и отрисовки в него входит.
+        spent_ms = (time.perf_counter() - started) * 1000.0
+        self.after(next_tick_delay(self._tick_delay(), spent_ms), self.tick)
 
     def _show_wait(self) -> None:
         """Ожидание телефона или ход контрольного прогона — пока не кончится."""
@@ -1725,9 +1770,11 @@ class App(tk.Tk):
             self.status.configure(text=problem, fg=WARN)
 
     def _detector_problem(self) -> str | None:
-        for pipeline in self.session.pipelines:
-            if pipeline.detector_error:
-                return f"Детектор не включён: {pipeline.detector_error}. Сейчас ищу по движению — это не то!"
+        # В режиме 3D-ящика детектор конвейера не запускается: рамки даёт детектор грузовика сессии.
+        if not self.session.box_mode:
+            for pipeline in self.session.pipelines:
+                if pipeline.detector_error:
+                    return f"Детектор не включён: {pipeline.detector_error}. Сейчас ищу по движению — это не то!"
         # Детектор 3D-режима машины (vehicle.detector): False — веса или ultralytics не загрузились.
         if False in getattr(self.session, "_truck_detectors", {}).values():
             return "Детектор грузовика не загрузился (веса в models/ или ultralytics). Сейчас ищу по фону."
@@ -1735,6 +1782,8 @@ class App(tk.Tk):
 
     def _detector_note(self) -> str | None:
         """Режим детектора по описанию, устройство и мс; или почему он не включился."""
+        if self.session.box_mode:
+            return truck_detector_note(self.session)
         for pipeline in self.session.pipelines:
             if pipeline.detector_error:
                 return f"детектор {self.profile.mode} не включён: {pipeline.detector_error} — работает движение"

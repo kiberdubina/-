@@ -1,11 +1,22 @@
 """Оценка удержания рамки и совпадения траектории.
 
 PASS: hold>=90% кадров с видимой целью; trail>=80% (ошибка центра < 6% диагонали).
+Правда на кадре — цветовая маска цели (GT_FN), от детектора конвейера она не зависит.
+
+Ролики CASES снимались у участника и в репозиторий не попали (*.mp4 и *.mov в .gitignore).
+Нет ролика — вместо него сцена того же вида из _synthetic_clips.py (кроме --no-synthetic):
+это проверка того, что конвейер работает, а не точность на реальной съёмке.
+Отчёт по исходным роликам — _eval_hold_trail_report.json; синтетика и --video пишут его
+во временную папку и исходный отчёт не трогают. Ни одного ролика — код 2, отчёт не пишется.
+
+Свой ролик: python _eval_hold_trail.py --video РОЛИК --profiles green_ball,motion --gt green
 """
 
 from __future__ import annotations
 
+import argparse
 import json
+import tempfile
 from pathlib import Path
 
 import cv2
@@ -117,7 +128,7 @@ def point_in_bbox(cx: float, cy: float, bbox) -> bool:
 
 
 def evaluate(video: str, profile_name: str, gt_name: str) -> dict:
-    path = ROOT / video
+    path = Path(video) if Path(video).is_absolute() else ROOT / video
     patterns = load_patterns(ROOT / "config.yaml")
     profile = patterns[profile_name]
     source = VideoSource(str(path), "file")
@@ -193,7 +204,7 @@ def evaluate(video: str, profile_name: str, gt_name: str) -> dict:
 
     passed = gt_visible >= 8 and hold_r >= HOLD_PASS and trail_score >= TRAIL_PASS
     return {
-        "video": video,
+        "video": Path(video).name,
         "profile": profile_name,
         "gt": gt_name,
         "frames": total,
@@ -209,31 +220,73 @@ def evaluate(video: str, profile_name: str, gt_name: str) -> dict:
     }
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Удержание рамки и совпадение траектории")
+    parser.add_argument("--video", type=Path, help="свой ролик вместо списка CASES")
+    parser.add_argument("--profiles", default="motion", help="профили через запятую (с --video)")
+    parser.add_argument("--gt", choices=sorted(GT_FN), default="green", help="правда на кадре (с --video)")
+    parser.add_argument("--no-synthetic", action="store_true", help="нет ролика — пропустить, без синтетики")
+    parser.add_argument("--report", type=Path, help="куда писать отчёт JSON")
+    args = parser.parse_args(argv)
+    if args.video is not None:
+        cases = [{"video": str(args.video.resolve()), "profiles": args.profiles.split(","), "gt": args.gt}]
+    else:
+        cases = CASES
+
     rows = []
     best_by_video: dict[str, dict] = {}
-    for case in CASES:
-        video = case["video"]
-        if not (ROOT / video).is_file():
-            rows.append({"video": video, "error": "missing"})
-            continue
-        for pname in case["profiles"]:
-            row = evaluate(video, pname, case["gt"])
-            rows.append(row)
-            prev = best_by_video.get(video)
-            if prev is None or (row["hold"], row["trail_score"]) > (prev["hold"], prev["trail_score"]):
-                best_by_video[video] = row
+    synthetic = False
+    with tempfile.TemporaryDirectory() as folder:
+        made: set[str] = set()
+        for case in cases:
+            video = case["video"]
+            path = Path(video) if Path(video).is_absolute() else ROOT / video
+            label, source = Path(video).name, "real"
+            if not path.is_file():
+                if args.video is not None or args.no_synthetic:
+                    rows.append({"video": label, "error": "missing"})
+                    continue
+                kind = case["gt"]
+                label = f"synthetic:{kind}"
+                rows.append({"video": Path(video).name, "error": "missing", "replaced_by": label})
+                # Одна сцена заменяет все пропавшие ролики своего вида.
+                if kind in made:
+                    continue
+                from _synthetic_clips import KINDS
 
+                path = KINDS[kind](Path(folder)).path
+                made.add(kind)
+                source = f"synthetic, вместо {Path(video).name}"
+                synthetic = True
+            for pname in case["profiles"]:
+                row = evaluate(str(path), pname, case["gt"])
+                row["video"] = label
+                row["source"] = source
+                rows.append(row)
+                prev = best_by_video.get(label)
+                if prev is None or (row["hold"], row["trail_score"]) > (prev["hold"], prev["trail_score"]):
+                    best_by_video[label] = row
+
+    if not best_by_video:
+        print("Ни одного ролика не оценено: " + ", ".join(row["video"] for row in rows if "error" in row))
+        raise SystemExit(2)
     report = {
         "criteria": {"hold": HOLD_PASS, "trail": TRAIL_PASS, "err_diag_frac": ERR_DIAG_FRAC},
         "all_runs": rows,
         "best_per_video": list(best_by_video.values()),
     }
-    path = ROOT / "_eval_hold_trail_report.json"
+    if args.report is not None:
+        path = args.report
+    elif args.video is None and not synthetic:
+        path = ROOT / "_eval_hold_trail_report.json"
+    else:
+        path = Path(tempfile.gettempdir()) / "peleng_eval_hold_trail.json"
     path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("=" * 76)
     print("BEST per video (acceptance)")
+    if synthetic:
+        print("synthetic — проверка работоспособности, не точность на реальной съёмке")
     print("=" * 76)
     fails = 0
     for video, row in ((v, best_by_video[v]) for v in best_by_video):

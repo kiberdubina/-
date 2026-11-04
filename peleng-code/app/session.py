@@ -340,8 +340,14 @@ class Session:
         if close is not None:
             close()
 
+    @property
+    def box_mode(self) -> bool:
+        """3D — подгонка ящика машины по рамкам камер (в профиле габарит, позы у двух камер и больше).
+        Иначе — триангуляция центров 2D-треков."""
+        return self.vehicle is not None and len(self.poses) >= 2
+
     def step(self) -> Tick | None:
-        if self.vehicle is not None and len(self.poses) >= 2:
+        if self.box_mode:
             return self._step_vehicle()
         steps: list[Step] = []
         for pipeline in self.pipelines:
@@ -391,10 +397,12 @@ class Session:
                 self._trail_reset()
             self._refresh_pose(pipeline, frame)
             frames.append(frame)
-            pose = self.poses.get(frame.camera_id)
-            if pose is None:
-                continue
-            detected = self._truck_blobs(frame)
+        posed = [frame for frame in frames if self.poses.get(frame.camera_id) is not None]
+        # Рамки всех камер — одним прогоном сети: на GPU это быстрее, чем камера за камерой.
+        truck_blobs = self._truck_blobs(posed)
+        for frame in posed:
+            pose = self.poses[frame.camera_id]
+            detected = truck_blobs.get(frame.camera_id, [])
             if self._detector_only(frame.camera_id, pose) and self._truck_detectors.get(frame.camera_id):
                 # Едущая камера (или профиль «только детектор»): фон с параллаксом только мешает.
                 blobs = detected
@@ -487,12 +495,31 @@ class Session:
             self._translating.add(camera_id)
         return camera_id in self._translating
 
-    def _truck_blobs(self, frame) -> list[Blob]:
-        """Рамки детектора грузовика (vehicle.detector в профиле) как пятна для подгонки ящика."""
+    def _truck_blobs(self, frames: list) -> dict[str, list[Blob]]:
+        """Рамки детектора грузовика (vehicle.detector в профиле) как пятна для подгонки ящика.
+
+        Все камеры кадра — одним вызовом detect_batch; рамки те же, что у detect по камерам.
+        """
         spec = self.profile.vehicle or {}
         if not spec.get("detector") or spec.get("detector_mode", "both") == "background":
-            return []
-        detector = self._truck_detectors.get(frame.camera_id)
+            return {}
+        from app.object_detector import detect_batch
+
+        items = []
+        for frame in frames:
+            detector = self._truck_detector(frame.camera_id, str(spec["detector"]))
+            if detector:
+                items.append((frame.camera_id, detector, frame.image))
+        found = detect_batch([(detector, image) for _, detector, image in items])
+        return {
+            camera_id: [Blob(float(x), float(y), float(w), float(h), float(w * h)) for x, y, w, h in
+                        (item.bbox for item in detections)]
+            for (camera_id, _, _), detections in zip(items, found)
+        }
+
+    def _truck_detector(self, camera_id: str, weights: str):
+        """Детектор грузовика камеры, собранный при первом кадре; False — веса или ultralytics не загрузились."""
+        detector = self._truck_detectors.get(camera_id)
         if detector is None:
             from app.object_detector import DetectorError, ObjectDetector, parse_spec
 
@@ -500,18 +527,13 @@ class Session:
             wide = TargetProfile("truck_detector", 0.0, 1e12, 0.0, 1e9, 0.0, 1e9, 0.0, 1e9, None, 0.5, None)
             try:
                 detector = ObjectDetector(wide, parse_spec({
-                    "mode": "object", "class": "truck", "model": str(spec["detector"]), "conf": 0.25,
+                    "mode": "object", "class": "truck", "model": weights, "conf": 0.25,
                     "det_every": 1, "det_width": 960, "roi_scale": 0,
                 }))
             except DetectorError:
                 detector = False
-            self._truck_detectors[frame.camera_id] = detector
-        if detector is False:
-            return []
-        return [
-            Blob(float(x), float(y), float(w), float(h), float(w * h))
-            for x, y, w, h in (item.bbox for item in detector.detect(frame.image))
-        ]
+            self._truck_detectors[camera_id] = detector
+        return detector
 
     def _vehicle_step(self, frame, bbox) -> Step:
         """Шаг камеры для окна: рамка — силуэт, вошедший в измерение 3D-ящика.
