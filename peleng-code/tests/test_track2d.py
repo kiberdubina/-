@@ -8,7 +8,7 @@ sys.path.insert(0, str(ROOT))
 
 from app.motion import Detection
 from app.profile import load_patterns
-from app.track2d import Track2D
+from app.track2d import CenterHistory, Track2D, theil_sen
 
 
 def _spot(x: float, y: float) -> Detection:
@@ -69,6 +69,34 @@ class Track2DTest(unittest.TestCase):
         jumped = tracker.update(_spot(before.cx, before.cy + 400), 11 * 0.04)
         self.assertLess(abs(jumped.cy - before.cy), 140)
         self.assertTrue(all(abs(y - 200) < 140 for _x, y in jumped.trail))
+
+
+
+class CenterHistoryTest(unittest.TestCase):
+    def test_velocity_and_trail(self):
+        history = CenterHistory()
+        for index in range(6):
+            history.add(100.0 + 30.0 * index, 50.0 - 6.0 * index, index / 30.0)
+        vx, vy = history.velocity()
+        self.assertAlmostEqual(vx, 900.0, places=3)
+        self.assertAlmostEqual(vy, -180.0, places=3)
+        self.assertEqual(len(history.trail()), 6)
+        self.assertEqual(history.trail()[0], (100.0, 50.0))
+
+    def test_rewind_or_long_gap_starts_new_trail(self):
+        history = CenterHistory()
+        for index in range(5):
+            history.add(10.0 * index, 0.0, index / 30.0)
+        history.add(0.0, 0.0, 0.0)  # перемотка видео
+        self.assertEqual(len(history.trail()), 1)
+        history.add(5.0, 0.0, 2.0)  # пропуск дольше полсекунды
+        self.assertEqual(history.trail(), ((5.0, 0.0),))
+        self.assertEqual(history.velocity(), (0.0, 0.0))
+
+    def test_theil_sen_ignores_one_jump(self):
+        samples = [(0.0, 0.0, 0.0), (10.0, 0.0, 0.1), (200.0, 0.0, 0.2), (30.0, 0.0, 0.3)]
+        vx, _vy = theil_sen(samples)
+        self.assertAlmostEqual(vx, 100.0, delta=1.0)
 
 
 if __name__ == "__main__":

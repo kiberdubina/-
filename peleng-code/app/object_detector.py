@@ -47,6 +47,8 @@ DET_WIDTH = 640
 ROI_SCALE = 2.5
 ROI_MIN_PX = 96
 COLOR_SHARE = 0.3
+# Зазор между рамками, при котором они склеиваются (доля размера большей рамки).
+MERGE_GAP = 0.1
 
 COCO_NAMES = (
     "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
@@ -126,6 +128,8 @@ class DetectSpec:
     det_width: int
     det_every: int
     roi_scale: float
+    # Склеивать соседние рамки цели в одну: кабина и прицеп — одна фура.
+    merge: bool = False
 
 
 @dataclass
@@ -199,6 +203,7 @@ def parse_spec(raw: dict) -> DetectSpec:
         det_width=int(raw.get("det_width", DET_WIDTH)),
         det_every=max(1, int(raw.get("det_every", base["det_every"]))),
         roi_scale=float(raw.get("roi_scale", ROI_SCALE)),
+        merge=bool(raw.get("merge", False)),
     )
 
 
@@ -447,6 +452,8 @@ class ObjectDetector:
             label = self._accept(image, box, scale, x0, y0)
             if label is not None:
                 labels.append(label)
+        if self.spec.merge:
+            labels = merge_labels(labels)
         # Без трека берётся самый уверенный, при равенстве — крупнейший.
         labels.sort(key=lambda item: (-item.conf, -item.detection.area))
         self._state.labels = labels
@@ -472,6 +479,42 @@ class ObjectDetector:
                 return None
         detection = Detection(cx=left + w / 2.0, cy=top + h / 2.0, area=area, bbox=bbox)
         return Label(detection, box.name, box.conf)
+
+
+def _touching(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+    """Рамки перекрываются или между ними зазор меньше 10 % размера большей."""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    gap_x = max(bx - (ax + aw), ax - (bx + bw), 0)
+    gap_y = max(by - (ay + ah), ay - (by + bh), 0)
+    return gap_x <= MERGE_GAP * max(aw, bw) and gap_y <= MERGE_GAP * max(ah, bh)
+
+
+def merge_labels(labels: list[Label]) -> list[Label]:
+    """Касающиеся рамки — одна цель: общая рамка, уверенность лучшей из них."""
+    items = list(labels)
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(items)):
+            for j in range(i + 1, len(items)):
+                a, b = items[i], items[j]
+                if not _touching(a.detection.bbox, b.detection.bbox):
+                    continue
+                ax, ay, aw, ah = a.detection.bbox
+                bx, by, bw, bh = b.detection.bbox
+                left, top = min(ax, bx), min(ay, by)
+                w = max(ax + aw, bx + bw) - left
+                h = max(ay + ah, by + bh) - top
+                best = a if a.conf >= b.conf else b
+                detection = Detection(left + w / 2.0, top + h / 2.0, float(w * h), (left, top, w, h))
+                items[i] = Label(detection, best.name, best.conf)
+                del items[j]
+                merged = True
+                break
+            if merged:
+                break
+    return items
 
 
 def build_detector(profile: TargetProfile, raw: dict | None, model=None):

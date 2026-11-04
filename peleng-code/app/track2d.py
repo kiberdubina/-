@@ -21,11 +21,57 @@ AREA_COST_PX = 40.0
 TRAIL_MIN_PX = 3.0
 # Скорость линии прогноза — по последним принятым измерениям.
 VELOCITY_WINDOW = 4
+# След центра рамки в режиме 3D-ящика: столько последних точек, разрыв дольше — новый след.
+HISTORY_POINTS = 60
+HISTORY_GAP_S = 0.5
 # Потолок живого допуска: даже на большой скорости сотни пикселей не проходят.
 GATE_CAP_PX = 280.0
 # Новый трек — только после стольких измерений подряд. Вспышка листвы, тени или шума
 # на кадр-другой не рисует рамку, след и прогноз и не идёт в 3D.
 CONFIRM_HITS = 3
+
+
+def theil_sen(samples: list[tuple[float, float, float]]) -> tuple[float, float] | None:
+    """Скорость (px/с) по точкам (x, y, t): медиана наклонов по всем парам."""
+    slopes_x = []
+    slopes_y = []
+    for first in range(len(samples)):
+        for second in range(first + 1, len(samples)):
+            span = samples[second][2] - samples[first][2]
+            if span > 1e-4:
+                slopes_x.append((samples[second][0] - samples[first][0]) / span)
+                slopes_y.append((samples[second][1] - samples[first][1]) / span)
+    if not slopes_x:
+        return None
+    return float(np.median(slopes_x)), float(np.median(slopes_y))
+
+
+class CenterHistory:
+    """Центры рамки одной камеры по времени: след, скорость и прогноз без своего фильтра.
+
+    Для режима 3D-ящика: рамку там даёт слияние камер, а окну нужны те же след,
+    вектор скорости и прогноз, что у 2D-трека.
+    """
+
+    def __init__(self) -> None:
+        self.samples: list[tuple[float, float, float]] = []
+
+    def add(self, cx: float, cy: float, time_s: float) -> None:
+        if self.samples:
+            last_t = self.samples[-1][2]
+            # Перемотка или долгий пропуск — старый след уже не про эту цель.
+            if time_s < last_t or time_s - last_t > HISTORY_GAP_S:
+                self.samples.clear()
+        self.samples.append((float(cx), float(cy), float(time_s)))
+        del self.samples[:-HISTORY_POINTS]
+
+    def velocity(self) -> tuple[float, float]:
+        if len(self.samples) < VELOCITY_WINDOW:
+            return 0.0, 0.0
+        return theil_sen(self.samples[-VELOCITY_WINDOW:]) or (0.0, 0.0)
+
+    def trail(self) -> tuple[tuple[float, float], ...]:
+        return tuple((x, y) for x, y, _ in self.samples)
 
 
 @dataclass
@@ -188,17 +234,9 @@ class Track2D:
         соседнее пятно её не раздувает, и прогноз не улетает. Прямая МНК — раздувала.
         """
         if len(self.samples) >= VELOCITY_WINDOW:
-            window = self.samples[-VELOCITY_WINDOW:]
-            slopes_x = []
-            slopes_y = []
-            for first in range(len(window)):
-                for second in range(first + 1, len(window)):
-                    span = window[second][2] - window[first][2]
-                    if span > 1e-4:
-                        slopes_x.append((window[second][0] - window[first][0]) / span)
-                        slopes_y.append((window[second][1] - window[first][1]) / span)
-            if slopes_x:
-                return float(np.median(slopes_x)), float(np.median(slopes_y))
+            velocity = theil_sen(self.samples[-VELOCITY_WINDOW:])
+            if velocity is not None:
+                return velocity
         return float(self.kf.statePost[2, 0]), float(self.kf.statePost[3, 0])
 
     def _snap_filter(self, spot: Detection) -> None:
@@ -348,15 +386,36 @@ SELECT_NEAR_PX = 40.0
 # Выбранная потерялась: трек ближе этого к её последнему месту и не позже — она же.
 RELOCK_PX = 150.0
 RELOCK_S = 3.0
+# Подтверждённая цель пропала (ушла за кадр, перекрыта) — режим LOST, потом SEARCH.
+# Размер цели — наибольшая площадь за последние SIZE_MEMORY_S: пока она уходит за край,
+# видимая площадь падает, и по ней обрывок мельче облака сошёл бы за «ту же цель».
+SIZE_MEMORY_S = 3.0
+# LOST: столько секунд новая цель — только пятно похожего размера (в LOST_AREA_RATIO раз).
+LOST_S = 5.0
+LOST_AREA_RATIO = 4.0
+# SEARCH после потери: пятно мельче этой доли прежней цели целью не станет
+# (облако 15×8 px на месте ушедшей фуры в 20 000 px).
+SEARCH_AREA_SHARE = 0.1
+LOST_STATE = "цель потеряна"
 
 
 class MultiTrack2D:
-    """Несколько Track2D: пятна раздаются по очереди, ворота не дают перехватить чужим."""
+    """Несколько Track2D: пятна раздаются по очереди, ворота не дают перехватить чужим.
+
+    Режимы главной цели: SEARCH (нет памяти — берётся крупнейшее пятно), TRACKING
+    (цель подтверждена, её размер запоминается), LOST (цель пропала — новая только похожего
+    размера) и SEARCH после потери (новая не мельче SEARCH_AREA_SHARE прежней).
+    """
 
     def __init__(self, profile: TargetProfile):
         self._profile = profile
         self._tracks: list[Track2D] = []
         self._last_views: list[TrackView] = []
+        # TRACKING: главный трек и площади его измерений (время, площадь) за SIZE_MEMORY_S.
+        self._sized: Track2D | None = None
+        self._sizes: list[tuple[float, float]] = []
+        # LOST/SEARCH: размер пропавшей цели и время пропажи.
+        self._missing: tuple[float, float] | None = None
         # Выбор машины оператором: главный трек закреплён за ней и не уходит на соседнюю.
         self._locked = False
         self._selected: Track2D | None = None
@@ -418,6 +477,8 @@ class MultiTrack2D:
         self._locked = True
         self._selected = track
         self._lost = None
+        # Цель выбрал оператор (или она же вернулась) — память пропавшей больше не нужна.
+        self._missing = None
 
     @property
     def profile(self) -> TargetProfile:
@@ -447,6 +508,14 @@ class MultiTrack2D:
         self._last_views.clear()
         self.clear_selection()
         self._last_spots = []
+        self._sized = None
+        self._sizes = []
+        self._missing = None
+
+    @property
+    def lost(self) -> bool:
+        """LOST: подтверждённая цель пропала не дольше LOST_S назад."""
+        return self._missing is not None and self._last_time - self._missing[1] <= LOST_S
 
     def update(self, spots: list[Detection] | Detection | None, time_s: float) -> TrackView:
         self._last_spots = list(_as_spots(spots))
@@ -497,6 +566,36 @@ class MultiTrack2D:
         self._take(track)
         return True
 
+    def _remember_size(self, time_s: float) -> None:
+        """TRACKING → LOST: размер подтверждённой цели помнится, когда её трек пропал."""
+        sized = self._sized
+        if sized is not None and (sized not in self._tracks or not sized.ready):
+            if self._sizes:
+                self._missing = (max(area for _, area in self._sizes), float(time_s))
+            self._sized = None
+            self._sizes = []
+        primary = self._primary_track()
+        if primary is None:
+            return
+        if primary is not self._sized:
+            self._sized = primary
+            self._sizes = []
+        spot = primary.accepted
+        if spot is None or primary.hits < CONFIRM_HITS:
+            return
+        self._sizes.append((float(time_s), float(spot.area)))
+        self._sizes = [item for item in self._sizes if time_s - item[0] <= SIZE_MEMORY_S]
+        self._missing = None
+
+    def _admits(self, spot: Detection) -> bool:
+        """Может ли пятно стать новым треком: в LOST — похожего размера, после — не мелочь."""
+        if self._missing is None:
+            return True
+        area = self._missing[0]
+        if self.lost:
+            return area / LOST_AREA_RATIO <= spot.area <= area * LOST_AREA_RATIO
+        return spot.area >= area * SEARCH_AREA_SHARE
+
     def _idle_view(self) -> TrackView:
         return TrackView(
             False,
@@ -505,7 +604,7 @@ class MultiTrack2D:
             0.0,
             0.0,
             0.0,
-            "поиск",
+            LOST_STATE if self.lost else "поиск",
             False,
             False,
             0.0,
@@ -533,11 +632,12 @@ class MultiTrack2D:
 
         if not self._tracks:
             starter = Track2D(self._profile)
-            view = starter.update(remaining, time_s)
+            view = starter.update([spot for spot in remaining if self._admits(spot)], time_s)
             if starter.ready:
                 self._tracks.append(starter)
                 self._last_views.append(view)
                 self._drop_spot(remaining, starter.accepted)
+            self._remember_size(time_s)
             self._spawn_secondary(remaining, time_s)
             return self._finish_views()
 
@@ -555,6 +655,8 @@ class MultiTrack2D:
         kept.sort(key=lambda item: item[0])
         self._tracks = [track for _, track, _ in kept]
         self._last_views = [view for _, _, view in kept]
+        # Пропажу цели — до новых треков: на этом же кадре они уже идут через _admits.
+        self._remember_size(time_s)
         self._spawn_secondary(remaining, time_s)
         return self._finish_views()
 
@@ -567,7 +669,7 @@ class MultiTrack2D:
         for spot in list(remaining):
             if len(self._tracks) >= MAX_TRACKS_2D:
                 break
-            if not self._should_spawn(spot):
+            if not self._should_spawn(spot) or not self._admits(spot):
                 continue
             track = Track2D(self._profile)
             view = track.update([spot], time_s)

@@ -1462,38 +1462,50 @@ class App(tk.Tk):
             if other.bbox is not None:
                 x, y, w, h = other.bbox
                 cv2.rectangle(image, (x, y), (x + w, y + h), (150, 150, 150), 1)
+        # Кадр 1920 px в окне сжат в 4–5 раз, а приближение окна (_zoom_frame) снова растягивает
+        # рисунок: толщина и размеры — от ширины кадра с поправкой на приближение.
+        zoom = self.zoom_state.get(step.frame.camera_id, {}).get("zoom", 1.0)
+        unit = max(1, int(round(image.shape[1] / 640 / max(zoom, 1.0))))
         if track.bbox is not None:
             x, y, w, h = track.bbox
             color = (80, 220, 80) if track.in_gate else (0, 200, 255)
             if step.selected:
                 color = (0, 230, 255)
-            cv2.rectangle(image, (x, y), (x + w, y + h), color, 4 if step.selected else 2)
+            cv2.rectangle(image, (x, y), (x + w, y + h), color, (4 if step.selected else 2) * unit)
             cv2.putText(
                 image,
                 # cv2.putText не рисует кириллицу.
                 f"{self.session.target_id} TARGET" if step.selected else str(self.session.target_id),
-                (x, max(16, y - 6)),
+                (x, max(16 * unit, y - 6 * unit)),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
+                0.6 * unit,
                 color,
-                2,
+                2 * unit,
             )
         if track.pred_bbox is not None:
+            # Где будет рамка через горизонт прогноза.
             x, y, w, h = track.pred_bbox
-            cv2.rectangle(image, (x, y), (x + w, y + h), (0, 220, 255), 1)
+            cv2.rectangle(image, (x, y), (x + w, y + h), (0, 220, 255), unit)
+        # Где был центр в прошлых кадрах: линия и точки.
         trail = track.trail
         for index in range(1, len(trail)):
             x0, y0 = trail[index - 1]
             x1, y1 = trail[index]
-            if np.hypot(x1 - x0, y1 - y0) > 140:
+            if np.hypot(x1 - x0, y1 - y0) > 140 * unit:
                 continue
-            cv2.line(image, (int(x0), int(y0)), (int(x1), int(y1)), (255, 180, 40), 2)
+            cv2.line(image, (int(x0), int(y0)), (int(x1), int(y1)), (255, 180, 40), unit, cv2.LINE_AA)
+        for px, py in trail:
+            cv2.circle(image, (int(px), int(py)), 2 * unit, (255, 180, 40), -1, cv2.LINE_AA)
         if track.active:
             origin = (int(track.cx), int(track.cy))
             ahead = (int(track.pred_cx), int(track.pred_cy))
-            cv2.line(image, origin, ahead, (255, 0, 255), 2)
-            cv2.circle(image, origin, 4, (255, 255, 255), -1)
-            cv2.circle(image, ahead, 4, (255, 0, 255), -1)
+            # Вектор скорости: стрелка от центра к прогнозу.
+            if np.hypot(ahead[0] - origin[0], ahead[1] - origin[1]) > 3 * unit:
+                cv2.arrowedLine(image, origin, ahead, (255, 0, 255), 2 * unit, cv2.LINE_AA, tipLength=0.25)
+                cv2.circle(image, ahead, 4 * unit, (255, 0, 255), -1, cv2.LINE_AA)
+            # Центр цели — поверх всего.
+            cv2.circle(image, origin, 5 * unit, (0, 0, 0), -1, cv2.LINE_AA)
+            cv2.circle(image, origin, 4 * unit, (255, 255, 255), -1, cv2.LINE_AA)
         return image
 
     @staticmethod
@@ -1545,7 +1557,44 @@ class App(tk.Tk):
         state["crop"] = (x0, y0, x1, y1)
         return cv2.resize(crop, (width, height), interpolation=cv2.INTER_LINEAR)
 
+    def _mono_scene(self, tick) -> bool:
+        """Одна камера без позы: примерный путь цели (жёлтый) и условная камера в поле 3D."""
+        if self.session.poses or tick.trail or len(tick.steps) != 1:
+            return False
+        from app.mono import MONO_HFOV_DEG, MonoPath, target_height_m
+
+        height_m = target_height_m(self.profile)
+        if height_m is None:
+            return False
+        step = tick.steps[0]
+        key = (step.frame.camera_id, height_m)
+        if getattr(self, "_mono_key", None) != key:
+            self._mono = MonoPath(height_m)
+            self._mono_key = key
+        mono = self._mono
+        frame_h, frame_w = step.frame.image.shape[:2]
+        mono.update(step.track, frame_w, frame_h, step.frame.time_s)
+        if mono.depth_m is None:
+            hint = f"Одна камера: путь примерно, по высоте цели {height_m:.1f} м"
+        else:
+            where = mono.current if mono.current is not None else mono.trail[-1]
+            hint = (
+                f"примерно (одна камера, обзор ~{MONO_HFOV_DEG:.0f}°): "
+                f"до цели {mono.depth_m:.0f} м, в сторону {where[0]:+.0f} м"
+            )
+        self.scene.set_scene(
+            mono.trail,
+            mono.current,
+            mono.pred,
+            [mono.pose(frame_w, frame_h)],
+            hint,
+            trail_color="#ffd84a",
+        )
+        return True
+
     def _draw_scene(self, tick) -> None:
+        if self._mono_scene(tick):
+            return
         world = tick.world
         current = None if world.xyz is None else np.asarray(world.xyz, np.float64).reshape(3)
         if current is None and tick.trail:
@@ -1670,6 +1719,19 @@ class App(tk.Tk):
             following = self.session.selection_cameras()
             cams.append(f"выбрана машина — ведут {', '.join(following) or 'никто, жду её'}")
         self.cams_line.configure(text="     ".join(cams))
+        # Детектор цели не включился — видно сразу, а не только в подробностях (F2).
+        problem = self._detector_problem()
+        if problem and not self._notice and not self._phone_wait_text:
+            self.status.configure(text=problem, fg=WARN)
+
+    def _detector_problem(self) -> str | None:
+        for pipeline in self.session.pipelines:
+            if pipeline.detector_error:
+                return f"Детектор не включён: {pipeline.detector_error}. Сейчас ищу по движению — это не то!"
+        # Детектор 3D-режима машины (vehicle.detector): False — веса или ultralytics не загрузились.
+        if False in getattr(self.session, "_truck_detectors", {}).values():
+            return "Детектор грузовика не загрузился (веса в models/ или ultralytics). Сейчас ищу по фону."
+        return None
 
     def _detector_note(self) -> str | None:
         """Режим детектора по описанию, устройство и мс; или почему он не включился."""

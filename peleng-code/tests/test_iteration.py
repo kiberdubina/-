@@ -45,7 +45,8 @@ VIDEO = ROOT / "video_2026-11-01_22-06-07.mp4"
 
 class IterationTest(unittest.TestCase):
     def test_demo_circle_has_box_area_and_speed(self):
-        profile = load_profile(ROOT / "config.yaml")
+        # Не активная цель из окна (её меняет пользователь), а поиск по движению.
+        profile = load_patterns(ROOT / "config.yaml")["motion"]
         pipeline = Pipeline(profile, SyntheticSource())
         areas = []
         speeds = []

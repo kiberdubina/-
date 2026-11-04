@@ -9,6 +9,7 @@ from app.geom import CameraPose, camera_center, frustum_edges
 NEAR = 0.05
 # Силуэт ограничивающей сферы занимает эту долю половины кадра при zoom = 1.
 SPHERE_FILL = 0.78
+TRAIL_COLOR = "#f0b45a"
 
 
 def scene_radius(points: np.ndarray, target: np.ndarray) -> float:
@@ -121,7 +122,10 @@ class SceneCanvas(tk.Canvas):
         rays: list[tuple[np.ndarray, np.ndarray]] | None = None,
         box: np.ndarray | None = None,
         path: np.ndarray | None = None,
+        trail_color: str | None = None,
     ) -> None:
+        # Цвет пройденного пути: по умолчанию оранжевый, для примерного пути одной камеры — жёлтый.
+        self.trail_color = trail_color or TRAIL_COLOR
         self.box = None if box is None else np.asarray(box, np.float64).reshape(8, 3).copy()
         # Прогноз траектории до горизонта (WorldView.path); нет — прямой отрезок до pred.
         self.path = None if path is None else np.asarray(path, np.float64).reshape(-1, 3).copy()
@@ -346,7 +350,7 @@ class SceneCanvas(tk.Canvas):
             trail = np.stack(self.trail, axis=0)
             self._polyline(
                 self._project(trail, target, distance, width, height),
-                "#f0b45a",
+                getattr(self, "trail_color", TRAIL_COLOR),
                 2,
                 "trail",
             )
