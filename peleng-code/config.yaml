@@ -128,9 +128,11 @@ patterns:
       width_m: 5.13
       height_m: 6.43
       anchor_m: [15.43, -0.11, 3.01]
-      # Детектор грузовика (YOLOv8n, дообучен на Way1): пятна фона + рамки детектора.
-      # Way1: RMSE 2,93 → 2,41 м; три камеры: 23,0 → 12,5 м. Нет файла весов — только фон.
-      detector: models/truck_way1_all.pt
+      # Детектор грузовика: пятна фона + рамки детектора. YOLO-World с вшитыми запросами
+      # (как у truck_detector), не привязан к одной сцене. Контрольный прогон Way1:
+      # дообученная truck_way1_all.pt — RMSE 2,84 м, truck_world.pt — 2,18 м.
+      # Нет файла весов — только фон.
+      detector: models/truck_world.pt
       detector_mode: both
   # Цель по описанию (app/object_detector.py, нужен requirements-detect.txt и веса в models/).
   # s_*/u_*/r_*/v_* можно не задавать: отбор делает модель. Площадь — площадь рамки.

@@ -29,7 +29,7 @@ import numpy as np
 from app.background import BackgroundConfig, Blob, RecordingBackground, foreground_blobs
 from app.export_result import VideoSink
 from app.geom import CameraPose
-from app.metrics3d import compare_by_frame, frame_errors, write_metrics_report
+from app.metrics3d import compare_by_frame, error_summary, frame_errors, write_metrics_report
 from app.vehicle import (
     BOX_EDGES,
     PSI,
@@ -83,6 +83,8 @@ class ControlConfig:
     detector_conf: float = 0.25
     detector_width: int = 1280
     fusion: FusionConfig = field(default_factory=FusionConfig)
+    # Графики и видео результата; серия прогонов (таблица по числу камер) их пропускает.
+    media: bool = True
 
 
 @dataclass
@@ -444,16 +446,18 @@ def run_control(
         stats = compare_by_frame(frames, anchors, truth, total_frames=count)
         files["report"] = write_metrics_report(stats, out_dir / "metrics.txt")
         files["segments"] = write_segment_table(out_dir / "metrics_by_segment.csv", frames, anchors, truth)
+        files["cameras"] = write_camera_table(out_dir / "metrics_by_cameras.csv", frames, anchors, truth, observed)
         (out_dir / "metrics.json").write_text(json.dumps(stats, ensure_ascii=False, indent=1), encoding="utf-8")
     from app.excel_export import control_workbook
 
     workbook = control_workbook(out_dir / "trajectory.xlsx", files, stats)
     if workbook is not None:
         files["xlsx"] = workbook
-    say("графики", 0.0)
-    files.update(write_charts(out_dir, frames, states, model, clips[0].fps, truth))
-    say("видео", 0.0)
-    files.update(write_videos(out_dir, clips, states, observed, model, config, say))
+    if config.media:
+        say("графики", 0.0)
+        files.update(write_charts(out_dir, frames, states, model, clips[0].fps, truth))
+        say("видео", 0.0)
+        files.update(write_videos(out_dir, clips, states, observed, model, config, say))
     say("готово", 1.0)
     return ControlResult(frames, states, filtered, observed, stats, files)
 
@@ -570,6 +574,27 @@ def write_segment_table(
             writer.writerow([
                 start, start + size - 1, int(pick.sum()),
                 f"{np.median(part):.4f}", f"{np.sqrt(np.mean(part**2)):.4f}", f"{part.max():.4f}",
+            ])
+    return Path(path)
+
+
+CAMERA_TABLE_HEADER = ["cameras", "frames", "share", "rmse_m", "mae_m", "median_m", "p95_m", "max_m"]
+
+
+def write_camera_table(
+    path: Path, frames: list[int], anchors: np.ndarray, truth: np.ndarray, observed: dict[int, dict]
+) -> Path:
+    """Погрешность отдельно по числу камер, видевших цель на кадре (0 — кадр по инерции)."""
+    errors = frame_errors(frames, anchors, truth)
+    counts = np.array([len(observed.get(frame, {})) for frame in frames])
+    with Path(path).open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(CAMERA_TABLE_HEADER)
+        for count in sorted(set(counts.tolist())):
+            summary = error_summary(errors[counts == count])
+            writer.writerow([
+                count, summary["frames"], f"{summary['frames'] / max(len(frames), 1):.4f}",
+                *(f"{summary[key]:.4f}" for key in CAMERA_TABLE_HEADER[3:]),
             ])
     return Path(path)
 
