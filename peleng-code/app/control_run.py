@@ -75,6 +75,13 @@ class ControlConfig:
     # точка: без наблюдений трек летит по инерции и уходит на десятки метров. None — все кадры.
     coast_frames: int | None = 15
     background: BackgroundConfig = field(default_factory=BackgroundConfig)
+    # Детектор грузовика (YOLO, дообученный на Way1). Источник пятен для подгонки 3D-ящика:
+    # «background» — фон записи (как раньше), «detector» — рамки детектора (не зависят от
+    # движения камеры), «both» — пятна фона и рамки детектора вместе. Без весов — фон.
+    detector_weights: str | None = None
+    detector_mode: str = "background"
+    detector_conf: float = 0.25
+    detector_width: int = 1280
     fusion: FusionConfig = field(default_factory=FusionConfig)
 
 
@@ -173,6 +180,13 @@ def camera_blobs(
     exclude: dict[int, np.ndarray] | None = None,
 ) -> dict[int, list[Blob]]:
     """Фон-медиана записи и пятна переднего плана на каждом кадре одной камеры."""
+    mode = config.detector_mode if config.detector_weights else "background"
+    if mode == "both" and clip_translates(clip):
+        # Камера едет: медиана фона по записи размазана параллаксом — пятна только от детектора.
+        mode = "detector"
+    detected = detector_blobs(clip, config) if mode in ("detector", "both") else {}
+    if mode == "detector":
+        return detected
     background = RecordingBackground(clip.width, clip.height, config.background)
     for index, image in _frames(clip):
         if index % config.sample_every:
@@ -187,7 +201,80 @@ def camera_blobs(
     for index, image in _frames(clip):
         foreground = background.apply(image, clip.pose_at(index))
         blobs[index] = foreground_blobs(foreground, background.scale)
+    for index, boxes in detected.items():
+        blobs.setdefault(index, []).extend(boxes)
     return blobs
+
+
+def clip_translates(clip: CameraClip, limit_m: float = 0.5, samples: int = 25) -> bool:
+    """Камера записи сдвигается (а не только поворачивается) больше limit_m за запись."""
+    centers = []
+    for frame in np.linspace(0, max(0, clip.frames - 1), samples).astype(int):
+        pose = clip.pose_at(int(frame))
+        rotation, _ = cv2.Rodrigues(pose.rvec)
+        centers.append((-rotation.T @ np.asarray(pose.tvec, np.float64).reshape(3, 1)).ravel())
+    centers = np.asarray(centers)
+    return bool(np.linalg.norm(centers - centers[0], axis=1).max() > limit_m)
+
+
+def apply_detector(config: ControlConfig, vehicle: dict | None, weights: str | None = None,
+                   mode: str | None = None) -> str:
+    """Детектор грузовика для прогона: веса из аргумента или из блока vehicle профиля
+    (ключи detector, detector_mode). Нет файла весов — только фон. Возвращает строку для отчёта."""
+    vehicle = vehicle or {}
+    weights = weights or vehicle.get("detector")
+    if not weights:
+        return "детектор грузовика не задан — пятна по фону"
+    path = Path(weights)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent.parent / path
+    if not path.is_file():
+        return f"нет весов детектора {path.name} — пятна по фону"
+    try:
+        import ultralytics  # noqa: F401
+    except ImportError:
+        return "нет пакета ultralytics (pip install -r requirements-detect.txt) — пятна по фону"
+    config.detector_weights = str(path)
+    config.detector_mode = mode or vehicle.get("detector_mode", "both")
+    return f"детектор грузовика {path.name}, режим {config.detector_mode}"
+
+
+def detector_blobs(clip: CameraClip, config: ControlConfig) -> dict[int, list[Blob]]:
+    """Рамки детектора грузовика на каждом кадре камеры как пятна для подгонки ящика.
+
+    Детекции одного ролика с одними весами считаются один раз: второй проход и повторный
+    прогон берут их из кэша во временной папке.
+    """
+    import hashlib
+    import tempfile
+
+    from app.object_detector import ObjectDetector, parse_spec
+    from app.profile import TargetProfile
+
+    weights = Path(config.detector_weights or "")
+    if not weights.is_absolute():
+        weights = Path(__file__).resolve().parent.parent / weights
+    video = Path(clip.path)
+    key = "|".join(
+        str(item)
+        for item in (video.resolve(), video.stat().st_mtime_ns, weights.resolve(), weights.stat().st_mtime_ns,
+                     config.detector_conf, config.detector_width)
+    )
+    cache = Path(tempfile.gettempdir()) / f"peleng_truck_{hashlib.sha1(key.encode()).hexdigest()[:16]}.json"
+    if cache.is_file():
+        stored = json.loads(cache.read_text(encoding="utf-8"))
+        return {int(frame): [Blob(x, y, w, h, w * h) for x, y, w, h in boxes] for frame, boxes in stored.items()}
+    spec = parse_spec({
+        "mode": "object", "class": "truck", "model": str(weights), "conf": config.detector_conf,
+        "det_every": 1, "det_width": config.detector_width, "roi_scale": 0,
+    })
+    profile = TargetProfile("truck_detector", 0.0, 1e12, 0.0, 1e9, 0.0, 1e9, 0.0, 1e9, None, 0.5, None)
+    detector = ObjectDetector(profile, spec)
+    found: dict[int, list[list[float]]] = {}
+    for index, image in _frames(clip):
+        found[index] = [[float(value) for value in item.bbox] for item in detector.detect(image)]
+    cache.write_text(json.dumps(found), encoding="utf-8")
+    return {frame: [Blob(x, y, w, h, w * h) for x, y, w, h in boxes] for frame, boxes in found.items()}
 
 
 def all_blobs(

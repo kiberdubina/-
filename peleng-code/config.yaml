@@ -1,5 +1,5 @@
-active: motion
-predict_s: 0.5
+active: truck_text
+predict_s: 0.25
 board:
   squares_x: 5
   squares_y: 7
@@ -128,6 +128,10 @@ patterns:
       width_m: 5.13
       height_m: 6.43
       anchor_m: [15.43, -0.11, 3.01]
+      # Детектор грузовика (YOLOv8n, дообучен на Way1): пятна фона + рамки детектора.
+      # Way1: RMSE 2,93 → 2,41 м; три камеры: 23,0 → 12,5 м. Нет файла весов — только фон.
+      detector: models/truck_way1_all.pt
+      detector_mode: both
   # Цель по описанию (app/object_detector.py, нужен requirements-detect.txt и веса в models/).
   # s_*/u_*/r_*/v_* можно не задавать: отбор делает модель. Площадь — площадь рамки.
   black_hoodie_person:
@@ -161,3 +165,26 @@ patterns:
     r_min: 0.5
     r_max: 500.0
     v_max: 70.0
+  # Грузовик обученным детектором (models/truck_way1.pt): тот же 3D-ящик и опорная точка,
+  # что у way1, но пятна только от детектора — фон не нужен (камера может ехать).
+  truck_detector:
+    s_min: 40.0
+    s_max: 120000.0
+    u_min: 1.0
+    u_max: 8000.0
+    r_min: 1.0
+    r_max: 600.0
+    v_min: 0.05
+    v_max: 120.0
+    d_m: null
+    color: null
+    moving_camera: false
+    require_motion: false
+    vehicle:
+      front_m: 14.12
+      rear_m: -5.54
+      width_m: 5.13
+      height_m: 6.43
+      anchor_m: [15.43, -0.11, 3.01]
+      detector: models/truck_way1_all.pt
+      detector_mode: detector
