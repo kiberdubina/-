@@ -29,6 +29,56 @@ from app.view3d import SceneCanvas
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# Цвета окна: фон, панели, текст, приглушённый текст, акцент.
+BG = "#1c1c1c"
+PANEL = "#262626"
+FG = "#e8e8e8"
+MUTED = "#9a9a9a"
+ACCENT = "#4fa3ff"
+WARN = "#ffb84d"
+INFO = "#8cc4ff"
+GOOD = "#5cd65c"
+UI_FONT = "Segoe UI" if sys.platform == "win32" else "Helvetica"
+
+# Цели в меню и на панели. None — разделитель.
+TARGETS: list[tuple[str, str] | None] = [
+    ("motion", "Всё движение"),
+    ("black_shirt", "Чёрная футболка"),
+    ("green_ball", "Зелёный мяч"),
+    ("aircraft", "БПЛА"),
+    None,
+    ("black_hoodie_person", "Человек в чёрной кофте"),
+    ("red_car", "Красная машина"),
+    ("truck_text", "Грузовик (текст)"),
+    ("truck_detector", "Грузовик (детектор)"),
+    None,
+    ("traffic", "Транспорт"),
+]
+TARGET_NAMES = {key: label for key, label in (item for item in TARGETS if item)}
+TARGET_NAMES.update({"custom": "Своя цель", "text_custom": "Своя цель текстом", "way1": "Машина (Way1)"})
+HORIZONS = (0.25, 0.5, 1.0)
+
+HELP_TEXT = """Как пользоваться
+
+1. Источник — откуда кадры: телефон по USB, папка с роликами, видео или демо.
+2. Цель — что искать. «Транспорт»: Shift+клик по машине в окне камеры.
+3. Метры появляются, когда цель видят две камеры с известными позами
+   (папка с таблицами поз, «Демо 3D» или лист ChArUco в «Калибровке»).
+
+Мышь в окне камеры
+  клик — показать только эту камеру (ещё клик — все)
+  Shift+клик — следить за машиной
+  правый клик — выбрать машину, добавить или убрать камеру
+
+Клавиши
+  Ctrl+O — открыть видео        Ctrl+Shift+O — папка с роликами
+  Ctrl+S — сохранить контроль   Esc — все камеры / снять выбор
+  Пробел — пауза                1 / 2 / 3 — прогноз 0,25 / 0,5 / 1 с
+  F2 — подробности              F1 — эта справка
+
+Рамка камеры: зелёная — цель ведётся, серая — цели нет, синяя — показана одна.
+Поле 3D: угол слева внизу тянет размер."""
+
 
 def advance_zoom(
     state: dict[str, float],
@@ -158,7 +208,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Трекинг 3D")
-        self.configure(bg="#1c1c1c")
+        self.configure(bg=BG)
         self.profile = load_profile(ROOT / "config.yaml")
         self.patterns = load_patterns(ROOT / "config.yaml")
         self.board = load_board(ROOT / "config.yaml")
@@ -177,15 +227,30 @@ class App(tk.Tk):
         self._last_tiles: dict[str, np.ndarray] = {}
         self._dismissed_phones: set[str] = set()
         self._scene_drag: tuple[int, int, int, int] | None = None
+        # Короткое сообщение под сводкой: текст и момент, когда оно гаснет (мс).
+        self._notice = ""
+        self._notice_until = 0
+        self.show_details = tk.BooleanVar(value=False)
+        self._focus_shown: str | None = None
+        self._target_shown = ""
+        self.paused = False
+        # На паузе: последний кадр и просьба перерисовать его (сменили камеру).
+        self._last_tick = None
+        self._redraw = False
+        # Ведёт ли камера цель: от этого цвет рамки её окна.
+        self._tile_active: dict[str, bool] = {}
+        self.horizon_var = tk.DoubleVar(value=self.profile.predict_s)
 
-        body = tk.Frame(self, bg="#1c1c1c")
+        self._toolbar()
+        body = tk.Frame(self, bg=BG)
         body.pack(fill="both", expand=True)
         self.body = body
-        self.cameras = tk.Frame(body, bg="#1c1c1c")
+        self.cameras = tk.Frame(body, bg=BG)
         self.scene = SceneCanvas(body)
         # Сначала поле 3D справа, остаток ширины — камерам. Рост поля забирает этот остаток.
         self.scene.pack(side="right", anchor="n", padx=(0, 8), pady=8)
         self.cameras.pack(side="left", fill="both", expand=True, padx=(8, 4), pady=8)
+        self._start_screen()
         # size_ne_sw есть только в Tk под Windows; на macOS и Linux — свой угловой курсор.
         grip_cursor = "size_ne_sw" if sys.platform == "win32" else "bottom_left_corner"
         self._scene_grip = tk.Frame(
@@ -194,75 +259,278 @@ class App(tk.Tk):
         self._scene_grip.place(relx=0.0, rely=1.0, anchor="sw", width=16, height=16)
         self._scene_grip.bind("<ButtonPress-1>", self._scene_grip_press)
         self._scene_grip.bind("<B1-Motion>", self._scene_grip_drag)
-        self.status = tk.Label(
-            self,
-            text="",
-            fg="#e8e8e8",
-            bg="#1c1c1c",
-            font=("Segoe UI", 11),
-            justify=tk.LEFT,
-            anchor="w",
-        )
-        self.status.pack(fill="x", padx=12, pady=(0, 12))
+        self._info_panel()
         self._menu()
+        self._keys()
         self.geometry("1440x820")
         self.minsize(960, 560)
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         self.after(50, self._open_phones_first)
         self.after(16, self.tick)
 
+    # --- меню и панели -------------------------------------------------
+
+    def _source_menu(self, parent: tk.Misc) -> tk.Menu:
+        menu = tk.Menu(parent, tearoff=0)
+        menu.add_command(label="Телефон по USB", command=self.open_phone)
+        menu.add_command(label="Папка с роликами…", command=self.open_scene_folder, accelerator="Ctrl+Shift+O")
+        menu.add_command(label="Видео…", command=self.open_video, accelerator="Ctrl+O")
+        menu.add_command(label="Добавить ещё видео…", command=self.add_video)
+        menu.add_command(label="Поток по адресу…", command=self.open_url)
+        menu.add_separator()
+        menu.add_command(label="Демо (одна камера)", command=self.use_demo)
+        menu.add_command(label="Демо 3D (две камеры)", command=self.use_rig)
+        menu.add_command(label="Путь 5 камер (Way1)", command=self.use_way1)
+        return menu
+
+    def _target_menu(self, parent: tk.Misc) -> tk.Menu:
+        menu = tk.Menu(parent, tearoff=0)
+        # Цели по описанию (вторая группа) — модель YOLO / YOLO-World (requirements-detect.txt).
+        for item in TARGETS:
+            if item is None:
+                menu.add_separator()
+                continue
+            key, label = item
+            menu.add_command(label=label, command=lambda key=key: self.use_pattern(key))
+        menu.add_command(label="Снять выбор машины", command=self.clear_vehicle, accelerator="Esc")
+        menu.add_separator()
+        menu.add_command(label="Своя цель по размеру…", command=self.edit_custom)
+        menu.add_command(label="Своя цель текстом…", command=self.edit_text_query)
+        return menu
+
+    def _save_menu(self, parent: tk.Misc) -> tk.Menu:
+        menu = tk.Menu(parent, tearoff=0)
+        menu.add_command(label="Контрольный результат…", command=self.save_control, accelerator="Ctrl+S")
+        menu.add_command(label="Путь выбранной машины…", command=self.save_vehicle_path)
+        menu.add_command(label="Отчёт погрешности", command=self.save_metrics)
+        menu.add_separator()
+        menu.add_command(label="Контрольный прогон Way1…", command=self.run_way1_control)
+        menu.add_command(label="Контрольный прогон папки…", command=self.run_folder_control)
+        return menu
+
     def _menu(self) -> None:
         menu = tk.Menu(self)
-        file_menu = tk.Menu(menu, tearoff=0)
-        file_menu.add_command(label="Телефон", command=self.open_phone)
-        file_menu.add_command(label="Демо", command=self.use_demo)
-        file_menu.add_command(label="Демо 3D", command=self.use_rig)
-        file_menu.add_command(label="Путь 5 камер", command=self.use_way1)
-        file_menu.add_command(label="Открыть папку с роликами…", command=self.open_scene_folder)
-        file_menu.add_command(label="Открыть видео…", command=self.open_video)
-        file_menu.add_command(label="Добавить видео…", command=self.add_video)
-        file_menu.add_command(label="URL потока…", command=self.open_url)
-        file_menu.add_command(label="Сохранить контроль…", command=self.save_control)
-        file_menu.add_command(label="Отчёт погрешности…", command=self.save_metrics)
-        file_menu.add_command(label="Сохранить путь выбранной машины…", command=self.save_vehicle_path)
-        file_menu.add_command(label="Контрольный прогон Way1…", command=self.run_way1_control)
-        file_menu.add_command(label="Контрольный прогон папки…", command=self.run_folder_control)
-        file_menu.add_separator()
-        file_menu.add_command(label="Выход", command=self.destroy)
-        menu.add_cascade(label="Файл", menu=file_menu)
-
-        target_menu = tk.Menu(menu, tearoff=0)
-        target_menu.add_command(label="Всё движение", command=lambda: self.use_pattern("motion"))
-        target_menu.add_command(label="Чёрная футболка", command=lambda: self.use_pattern("black_shirt"))
-        target_menu.add_command(label="Зелёный мяч", command=lambda: self.use_pattern("green_ball"))
-        target_menu.add_command(label="БПЛА", command=lambda: self.use_pattern("aircraft"))
-        target_menu.add_command(label="Своя цель…", command=self.edit_custom)
-        target_menu.add_separator()
-        # Цель по описанию: модель YOLO / YOLO-World (requirements-detect.txt).
-        target_menu.add_command(
-            label="Человек в чёрной кофте", command=lambda: self.use_pattern("black_hoodie_person")
-        )
-        target_menu.add_command(label="Красная машина", command=lambda: self.use_pattern("red_car"))
-        target_menu.add_command(label="Грузовик (текст)", command=lambda: self.use_pattern("truck_text"))
-        target_menu.add_command(label="Своя цель текстом…", command=self.edit_text_query)
-        target_menu.add_separator()
-        # Поток машин: Shift+клик по машине в окне камеры — следить за ней.
-        target_menu.add_command(label="Транспорт (Shift+клик — выбрать машину)", command=lambda: self.use_pattern("traffic"))
-        target_menu.add_command(label="Снять выбор машины", command=self.clear_vehicle)
-        target_menu.add_separator()
-        for horizon in (0.25, 0.5, 1.0):
-            target_menu.add_command(
-                label=f"Прогноз {horizon:.2f} с".replace(".", ","),
-                command=lambda value=horizon: self.set_horizon(value),
-            )
-        menu.add_cascade(label="Цель", menu=target_menu)
+        menu.add_cascade(label="Источник", menu=self._source_menu(menu))
+        menu.add_cascade(label="Цель", menu=self._target_menu(menu))
 
         board_menu = tk.Menu(menu, tearoff=0)
-        board_menu.add_command(label="Сохранить лист ChArUco…", command=self.save_board)
-        board_menu.add_command(label="Снять кадр листа", command=self.snap_board)
-        board_menu.add_command(label="Позы по листу", command=self.solve_board)
+        board_menu.add_command(label="1. Сохранить лист ChArUco…", command=self.save_board)
+        board_menu.add_command(label="2. Снять кадр листа", command=self.snap_board)
+        board_menu.add_command(label="3. Позы по листу", command=self.solve_board)
         menu.add_cascade(label="Калибровка", menu=board_menu)
+
+        menu.add_cascade(label="Сохранить", menu=self._save_menu(menu))
+
+        view_menu = tk.Menu(menu, tearoff=0)
+        view_menu.add_command(label="Все камеры", command=self.show_all_cameras, accelerator="Esc")
+        view_menu.add_checkbutton(
+            label="Подробности", variable=self.show_details, command=self._toggle_details, accelerator="F2"
+        )
+        view_menu.add_separator()
+        view_menu.add_command(label="Справка", command=self.show_help, accelerator="F1")
+        view_menu.add_separator()
+        view_menu.add_command(label="Выход", command=self.destroy)
+        menu.add_cascade(label="Вид", menu=view_menu)
         self.config(menu=menu)
+
+    def _menu_button(self, parent: tk.Misc, text: str, build) -> tk.Menubutton:
+        button = tk.Menubutton(
+            parent,
+            text=text,
+            bg=PANEL,
+            fg=FG,
+            activebackground="#333333",
+            activeforeground=FG,
+            relief="flat",
+            padx=10,
+            pady=4,
+            font=(UI_FONT, 11),
+        )
+        button.configure(menu=build(button))
+        return button
+
+    def _toolbar(self) -> None:
+        """Верхняя полоса: откуда кадры, что ищем, прогноз, сохранить, справка."""
+        bar = tk.Frame(self, bg=PANEL)
+        bar.pack(fill="x")
+        self._menu_button(bar, "Источник ▾", self._source_menu).pack(side="left", padx=(8, 2), pady=4)
+        self.target_button = self._menu_button(bar, "", self._target_menu)
+        self.target_button.pack(side="left", padx=2, pady=4)
+        self._update_target_button()
+
+        tk.Label(bar, text="Прогноз", bg=PANEL, fg=MUTED, font=(UI_FONT, 11)).pack(side="left", padx=(16, 4))
+        for value in HORIZONS:
+            tk.Radiobutton(
+                bar,
+                text=f"{value:g} с".replace(".", ","),
+                value=value,
+                variable=self.horizon_var,
+                command=lambda value=value: self.set_horizon(value),
+                indicatoron=False,
+                bg=PANEL,
+                fg=FG,
+                selectcolor="#3a4a5e",
+                activebackground="#333333",
+                activeforeground=FG,
+                relief="flat",
+                offrelief="flat",
+                padx=8,
+                pady=2,
+                font=(UI_FONT, 10),
+            ).pack(side="left", padx=1)
+
+        self.pause_button = tk.Button(
+            bar,
+            text="⏸ Пауза",
+            command=self.toggle_pause,
+            bg=PANEL,
+            fg=FG,
+            activebackground="#333333",
+            relief="flat",
+            font=(UI_FONT, 11),
+        )
+        self.pause_button.pack(side="left", padx=(16, 2), pady=4)
+
+        tk.Button(
+            bar,
+            text="?",
+            command=self.show_help,
+            bg=PANEL,
+            fg=FG,
+            activebackground="#333333",
+            relief="flat",
+            width=2,
+            font=(UI_FONT, 11, "bold"),
+        ).pack(side="right", padx=(2, 8), pady=4)
+        self._menu_button(bar, "Сохранить ▾", self._save_menu).pack(side="right", padx=2, pady=4)
+        # Видна, только когда показана одна камера.
+        self.all_button = tk.Button(
+            bar,
+            text="← Все камеры",
+            command=self.show_all_cameras,
+            bg=PANEL,
+            fg=ACCENT,
+            activebackground="#333333",
+            relief="flat",
+            font=(UI_FONT, 11),
+        )
+
+    def _info_panel(self) -> None:
+        """Нижняя панель: крупно — где цель, ниже — камеры и подсказка."""
+        panel = tk.Frame(self, bg=BG)
+        panel.pack(fill="x", padx=12, pady=(0, 10))
+        self.info = panel
+        self.summary = tk.Label(panel, text="Нет камер — выберите «Источник» на панели сверху", fg=MUTED, bg=BG, font=(UI_FONT, 15, "bold"), anchor="w")
+        self.summary.pack(fill="x")
+        self.cams_line = tk.Label(panel, text="", fg=MUTED, bg=BG, font=(UI_FONT, 11), anchor="w")
+        self.cams_line.pack(fill="x")
+        self.status = tk.Label(panel, text="", fg=WARN, bg=BG, font=(UI_FONT, 11), anchor="w", justify=tk.LEFT)
+        self.status.pack(fill="x")
+        self.details = tk.Label(
+            panel, text="", fg=MUTED, bg=BG, font=(UI_FONT, 10), anchor="w", justify=tk.LEFT
+        )
+
+    def _keys(self) -> None:
+        self.bind("<F1>", lambda _e: self.show_help())
+        self.bind("<F2>", lambda _e: (self.show_details.set(not self.show_details.get()), self._toggle_details()))
+        self.bind("<Escape>", lambda _e: self._escape())
+        self.bind("<Control-o>", lambda _e: self.open_video())
+        self.bind("<Control-O>", lambda _e: self.open_scene_folder())
+        self.bind("<Control-s>", lambda _e: self.save_control())
+        self.bind("<space>", lambda _e: self.toggle_pause())
+        for key, value in zip("123", HORIZONS):
+            self.bind(key, lambda _e, value=value: self.set_horizon(value))
+
+    def _escape(self) -> None:
+        if self.focus is not None:
+            self.show_all_cameras()
+        elif self.session.selection_camera is not None:
+            self.clear_vehicle()
+
+    def _toggle_details(self) -> None:
+        if self.show_details.get():
+            self.details.pack(fill="x", pady=(4, 0))
+        else:
+            self.details.pack_forget()
+
+    def show_help(self) -> None:
+        messagebox.showinfo("Справка", HELP_TEXT, parent=self)
+
+    def show_all_cameras(self) -> None:
+        self.focus = None
+        self._update_focus_button()
+        self._redraw = True
+
+    def _update_focus_button(self) -> None:
+        if self.focus is None:
+            self.all_button.pack_forget()
+        else:
+            self.all_button.configure(text=f"← Все камеры (сейчас {self.focus})")
+            self.all_button.pack(side="right", padx=8, pady=4)
+
+    def _update_target_button(self) -> None:
+        name = TARGET_NAMES.get(self.profile.name, self.profile.name)
+        self.target_button.configure(text=f"Цель: {name} ▾")
+
+    def _start_screen(self) -> None:
+        """Пока камер нет — крупные кнопки «с чего начать» вместо чёрного окна."""
+        screen = tk.Frame(self.cameras, bg=BG)
+        self.start = screen
+        tk.Label(screen, text="С чего начать", fg=FG, bg=BG, font=(UI_FONT, 20, "bold")).pack(pady=(0, 4))
+        tk.Label(
+            screen,
+            text="Телефон по USB подключится сам. Или выберите запись:",
+            fg=MUTED,
+            bg=BG,
+            font=(UI_FONT, 12),
+        ).pack(pady=(0, 16))
+        choices = [
+            ("Папка с роликами", "все видео и таблицы поз — сразу 3D", self.open_scene_folder),
+            ("Видео", "один файл, только 2D", self.open_video),
+            ("Демо 3D", "две виртуальные камеры, метры сразу", self.use_rig),
+            ("Телефон по USB", "искать снова", self.open_phone),
+        ]
+        for title, hint, command in choices:
+            row = tk.Frame(screen, bg=PANEL, cursor="hand2")
+            row.pack(fill="x", pady=4)
+            head = tk.Label(row, text=title, fg=FG, bg=PANEL, font=(UI_FONT, 14, "bold"), anchor="w")
+            head.pack(fill="x", padx=16, pady=(10, 0))
+            note = tk.Label(row, text=hint, fg=MUTED, bg=PANEL, font=(UI_FONT, 11), anchor="w")
+            note.pack(fill="x", padx=16, pady=(0, 10))
+            for widget in (row, head, note):
+                widget.bind("<Button-1>", lambda _e, command=command: command())
+                widget.bind("<Enter>", lambda _e, row=row: self._hover(row, "#323232"))
+                widget.bind("<Leave>", lambda _e, row=row: self._hover(row, PANEL))
+        tk.Label(screen, text="F1 — справка", fg=MUTED, bg=BG, font=(UI_FONT, 11)).pack(pady=(16, 0))
+        self._start_shown = False
+
+    @staticmethod
+    def _hover(row: tk.Frame, color: str) -> None:
+        row.configure(bg=color)
+        for child in row.winfo_children():
+            child.configure(bg=color)
+
+    def _update_start_screen(self) -> None:
+        empty = all(getattr(p.source, "kind", None) == "blank" for p in self.session.pipelines)
+        if empty == self._start_shown:
+            return
+        self._start_shown = empty
+        if empty:
+            self.start.place(relx=0.5, rely=0.45, anchor="center", width=420)
+            self.start.lift()
+        else:
+            self.start.place_forget()
+
+    def toggle_pause(self) -> None:
+        self.paused = not self.paused
+        self.pause_button.configure(text="▶ Дальше" if self.paused else "⏸ Пауза")
+        self.notify("Пауза — пробел, чтобы продолжить." if self.paused else "Продолжаю.", 3)
+
+    def notify(self, text: str, seconds: float = 8.0, warn: bool = False) -> None:
+        """Сообщение под сводкой. Держится seconds, кадры его не затирают."""
+        self._notice = text
+        self._notice_until = int(self.tk.call("clock", "milliseconds")) + int(seconds * 1000)
+        self.status.configure(text=text, fg=WARN if warn else INFO)
 
     def save_control(self) -> None:
         folder = filedialog.askdirectory(
@@ -351,6 +619,9 @@ class App(tk.Tk):
         model = VehicleModel.from_config(pattern.vehicle)
         config = ControlConfig()
         config.fusion.range_m = (pattern.r_min, pattern.r_max)
+        from app.control_run import apply_detector
+
+        self._control_detector = apply_detector(config, pattern.vehicle)
         self._launch_control(clips, model, config, truth, out_dir)
 
     def run_folder_control(self) -> None:
@@ -387,8 +658,11 @@ class App(tk.Tk):
             return
         config = ControlConfig()
         config.fusion.range_m = (pattern.r_min, pattern.r_max)
+        from app.control_run import apply_detector
+
+        self._control_detector = apply_detector(config, pattern.vehicle)
         out_dir = ROOT / "reports" / f"{safe_name(scene.root.name)}_control"
-        self.status.configure(text=describe(scene))
+        self.notify(describe(scene))
         self._launch_control(clips, VehicleModel.from_config(pattern.vehicle), config, scene_truth(scene), out_dir)
 
     def _launch_control(self, clips, model, config, truth, out_dir: Path) -> None:
@@ -424,6 +698,8 @@ class App(tk.Tk):
             messagebox.showerror("Контрольный прогон", str(result))
             return
         lines = [f"Папка: {getattr(self, '_control_out', ROOT / 'reports' / 'way1_control')}"]
+        if getattr(self, "_control_detector", None):
+            lines.append(self._control_detector)
         if result is not None and result.stats:
             stats = result.stats
             lines += [
@@ -437,7 +713,7 @@ class App(tk.Tk):
 
     def open_phone(self) -> None:
         self._dismissed_phones.clear()
-        self.status.configure(text="Подключаю камеру телефона…")
+        self.notify("Подключаю камеру телефона…")
         self.update_idletasks()
         self.auto_phone = True
         self._attach_usb_phones(menu=True)
@@ -476,9 +752,7 @@ class App(tk.Tk):
         self.session.set_pose_source(ROOT)
         self.trails.clear()
         self.zoom_state.clear()
-        self.status.configure(
-            text=f"{len(sources)} камер. След 3D — только триангуляция по кадрам."
-        )
+        self.notify(f"{len(sources)} камер. След 3D — только триангуляция по кадрам.")
 
     def open_scene_folder(self) -> None:
         """Ролики любой записи: все видео папки, таблицы поз по именам. Позы есть — 3D, нет — 2D."""
@@ -531,7 +805,7 @@ class App(tk.Tk):
         self.scene_folder = scene
         self.trails.clear()
         self.zoom_state.clear()
-        self.status.configure(text=describe(scene))
+        self.notify(describe(scene))
         if any(word in note for note in scene.notes for word in ("проверьте", "не прочиталась", "не открылся")):
             messagebox.showwarning("Папка с роликами", describe(scene))
 
@@ -587,6 +861,7 @@ class App(tk.Tk):
 
     def use_pattern(self, name: str) -> None:
         if name not in self.patterns:
+            self.notify(f"Цели «{TARGET_NAMES.get(name, name)}» нет в config.yaml.", warn=True)
             return
         profile = self.patterns[name]
         profile.predict_s = self.profile.predict_s
@@ -594,6 +869,9 @@ class App(tk.Tk):
         self.session.set_profile(profile)
         # Только выбор: профиль в config.yaml не переписывается и не теряет поля.
         save_active(ROOT / "config.yaml", name, profile.predict_s)
+        self._update_target_button()
+        if name == "traffic":
+            self.notify("Транспорт: Shift+клик по машине в окне камеры — следить за ней.")
 
     def edit_text_query(self) -> None:
         current = self.patterns.get("text_custom")
@@ -617,6 +895,7 @@ class App(tk.Tk):
         self.use_pattern("text_custom")
 
     def set_horizon(self, value: float) -> None:
+        self.horizon_var.set(value)
         self.profile.predict_s = value
         self.session.profile.predict_s = value
         self.session.track3d.profile.predict_s = value
@@ -628,7 +907,7 @@ class App(tk.Tk):
         current = self.patterns.get("custom", self.profile)
         dialog = tk.Toplevel(self)
         dialog.title("Своя цель")
-        dialog.configure(bg="#1c1c1c")
+        dialog.configure(bg=BG)
         fields = {
             "s_min": tk.StringVar(value=str(int(current.s_min))),
             "s_max": tk.StringVar(value=str(int(current.s_max))),
@@ -642,7 +921,7 @@ class App(tk.Tk):
             "u_max": "Скорость до, px/с",
         }
         for row, key in enumerate(fields):
-            tk.Label(dialog, text=labels[key], fg="#e8e8e8", bg="#1c1c1c").grid(
+            tk.Label(dialog, text=labels[key], fg=FG, bg=BG).grid(
                 row=row, column=0, sticky="w", padx=8, pady=4
             )
             tk.Entry(dialog, textvariable=fields[key], width=12).grid(
@@ -653,8 +932,8 @@ class App(tk.Tk):
             dialog,
             text="Зелёный цвет",
             variable=use_color,
-            fg="#e8e8e8",
-            bg="#1c1c1c",
+            fg=FG,
+            bg=BG,
             selectcolor="#333333",
         ).grid(row=4, column=0, columnspan=2, sticky="w", padx=8)
 
@@ -733,6 +1012,8 @@ class App(tk.Tk):
 
     def toggle_focus(self, camera_id: str) -> None:
         self.focus = None if self.focus == camera_id else camera_id
+        self._update_focus_button()
+        self._redraw = True
 
     def _camera_popup(self, event: tk.Event, camera_id: str) -> None:
         """Правый клик по окну камеры: добавить другое видео или убрать это."""
@@ -756,7 +1037,7 @@ class App(tk.Tk):
     def select_vehicle(self, camera_id: str, px: float, py: float) -> None:
         """Shift+клик по машине в окне камеры: следить за ней на всех камерах."""
         if self.session.vehicle is not None and len(self.session.poses) >= 2:
-            self.status.configure(text="Режим 3D-ящика ведёт одну цель сам. Для выбора машины — «Цель → Транспорт».")
+            self.notify("Режим 3D-ящика ведёт одну цель сам. Для выбора машины — «Цель → Транспорт».", warn=True)
             return
         geom = self._tile_geom.get(camera_id)
         if geom is None:
@@ -764,13 +1045,13 @@ class App(tk.Tk):
         crop = self.zoom_state.get(camera_id, {}).get("crop")
         point = tile_to_image(px, py, *geom, crop=crop)
         if point is None or not self.session.select_target(camera_id, *point):
-            self.status.configure(text="Здесь машины нет — Shift+клик прямо по рамке машины.")
+            self.notify("Здесь машины нет — Shift+клик прямо по рамке машины.", warn=True)
             return
-        self.status.configure(text=f"Выбрана машина на {camera_id}: на других камерах она найдётся по геометрии.")
+        self.notify(f"Выбрана машина на {camera_id}: на других камерах она найдётся по геометрии.")
 
     def clear_vehicle(self) -> None:
         self.session.clear_target()
-        self.status.configure(text="Выбор машины снят.")
+        self.notify("Выбор машины снят.")
 
     def save_vehicle_path(self) -> None:
         """Путь выбранной машины (или главной цели) по кадрам: CSV и Excel."""
@@ -834,7 +1115,7 @@ class App(tk.Tk):
         self.session.set_sources([BlankSource()])
         self._forget_camera_images()
         self.scene.set_scene([], None, None, [], "Вторая камера даст метры")
-        self.status.configure(text="Камер нет. Правый клик по окну камеры — добавить видео.")
+        self.notify("Камер нет. Правый клик по окну камеры — добавить видео.")
 
     def _scene_grip_press(self, event: tk.Event) -> None:
         width = self.scene.winfo_width()
@@ -856,7 +1137,7 @@ class App(tk.Tk):
             new_w = min(new_w, max(240, body_w - TILE_MIN_W - 24))
         self.scene.set_view_size(new_w, new_h)
         self.update_idletasks()
-        need_h = int(self.scene.winfo_reqheight()) + int(self.status.winfo_reqheight()) + 36
+        need_h = int(self.scene.winfo_reqheight()) + int(self.info.winfo_reqheight()) + 36
         if int(self.winfo_height()) + 8 < need_h:
             self.geometry(f"{int(self.winfo_width())}x{need_h}")
             self.update_idletasks()
@@ -874,17 +1155,30 @@ class App(tk.Tk):
         self._fit_tiles(tiles)
 
     def _open_phones_first(self) -> None:
-        self.status.configure(text=self._phone_wait_text)
+        self._show_wait()
         self._schedule_phone_scan()
 
     def tick(self) -> None:
-        alive = self.session.step()
+        # На паузе кадры не берутся: видео стоит, картинка и след замирают.
+        alive = None if self.paused else self.session.step()
         stuck = self._release_stuck_phone()
+        self._update_start_screen()
         if alive is not None and not stuck:
+            self._last_tick = alive
             self._draw(alive)
+        elif self.paused and self._redraw and self._last_tick is not None:
+            self._draw(self._last_tick)
+        self._redraw = False
         if self._phone_wait_text:
-            self.status.configure(text=self._phone_wait_text)
+            self._show_wait()
+        elif self._notice and int(self.tk.call("clock", "milliseconds")) > self._notice_until:
+            self._notice = ""
+            self.status.configure(text="")
         self.after(self._tick_delay(), self.tick)
+
+    def _show_wait(self) -> None:
+        """Ожидание телефона или ход контрольного прогона — пока не кончится."""
+        self.status.configure(text=self._phone_wait_text or self._notice, fg=WARN)
 
     def _phone_pipelines(self) -> list:
         return [
@@ -1005,7 +1299,7 @@ class App(tk.Tk):
                 self.session.set_sources(opened)
         elif not phones and error:
             self._phone_wait_text = error
-            self.status.configure(text=error)
+            self.notify(error, warn=True)
         if self.auto_phone:
             delay = 3000 if phones or opened else 2000
             self.after(delay, self._schedule_phone_scan)
@@ -1054,6 +1348,9 @@ class App(tk.Tk):
         for index, (camera_id, image) in enumerate(tiles):
             self._tile_geom[camera_id] = (image.shape[1], image.shape[0], tile_w, tile_h)
             image = fit_camera_tile(image, tile_w, tile_h)
+            # Имя камеры в углу окна, поверх уже вписанного кадра — всегда одного размера.
+            cv2.rectangle(image, (0, 0), (12 + 9 * len(camera_id), 22), (20, 20, 20), -1)
+            cv2.putText(image, camera_id, (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230, 230, 230), 1, cv2.LINE_AA)
             rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             photo = ImageTk.PhotoImage(Image.fromarray(rgb))
             self.photos.append(photo)
@@ -1061,10 +1358,10 @@ class App(tk.Tk):
             if label is None:
                 label = tk.Label(
                     self.cameras,
-                    bg="#1c1c1c",
+                    bg=BG,
                     cursor="hand2",
                     bd=0,
-                    highlightthickness=1,
+                    highlightthickness=2,
                     highlightbackground="#333333",
                 )
                 label.bind(
@@ -1081,7 +1378,13 @@ class App(tk.Tk):
                     lambda event, camera_id=camera_id: self.select_vehicle(camera_id, event.x, event.y),
                 )
                 self.labels[camera_id] = label
-            label.configure(image=photo)
+            if self.focus == camera_id:
+                border = ACCENT
+            elif self._tile_active.get(camera_id):
+                border = GOOD
+            else:
+                border = "#333333"
+            label.configure(image=photo, highlightbackground=border)
             label._photo = photo
             label.grid(
                 row=index // cols,
@@ -1115,6 +1418,7 @@ class App(tk.Tk):
         }
         tiles: list[tuple[str, np.ndarray]] = []
         for step in visible:
+            self._tile_active[step.frame.camera_id] = bool(step.track.active)
             image = self._annotate(step, getattr(tick, "box", None))
             image = self._zoom_frame(step.frame.camera_id, image, step.track)
             self._last_tiles[step.frame.camera_id] = image
@@ -1269,9 +1573,19 @@ class App(tk.Tk):
             hint,
             tick.rays,
             getattr(tick, "box", None),
+            None if not world.active else getattr(world, "path", None),
         )
 
     def _draw_status(self, tick) -> None:
+        self._draw_summary(tick)
+        if self._focus_shown != self.focus:
+            self._focus_shown = self.focus
+            self._update_focus_button()
+        if self._target_shown != self.profile.name:
+            self._target_shown = self.profile.name
+            self._update_target_button()
+        if not self.show_details.get():
+            return
         parts = []
         if self.session.selection_camera is not None:
             following = self.session.selection_cameras()
@@ -1318,7 +1632,44 @@ class App(tk.Tk):
         for note in phone_usb.skipped.values():
             if note and note not in parts:
                 parts.append(note)
-        self.status.configure(text="\n".join(parts))
+        self.details.configure(text="\n".join(parts))
+
+    def _draw_summary(self, tick) -> None:
+        """Одна крупная строка — где цель; вторая — что видит каждая камера."""
+        world = tick.world
+        steps = [step for step in tick.steps if step.frame.camera_id != "wait"]
+        target = self.session.target_id
+        if world.active and world.xyz is not None:
+            x, y, z = world.xyz[:3]
+            text = (
+                f"● Цель {target}    X {x:.2f}   Y {y:.2f}   Z {z:.2f} м    "
+                f"{world.speed_m_s:.2f} м/с    дальность {np.linalg.norm(world.xyz):.2f} м"
+            )
+            sigma = getattr(tick, "sigma_m", None)
+            if sigma is not None:
+                text += f"    ±{sigma:.1f} м"
+            color = FG
+        elif not steps:
+            text = "Нет камер — выберите «Источник» на панели сверху"
+            color = MUTED
+        elif len(self.session.poses) >= 2:
+            text = "Цель ищется — для метров её должны видеть две камеры сразу"
+            color = MUTED
+        else:
+            text = "Только 2D — для метров нужны две камеры с позами (см. «Калибровка» или F1)"
+            color = MUTED
+        self.summary.configure(text=text, fg=color)
+
+        cams = []
+        for step in steps:
+            track = step.track
+            mark = "●" if track.active else "○"
+            pose = "" if step.frame.camera_id in self.session.poses else " без позы"
+            cams.append(f"{mark} {step.frame.camera_id}: {track.state}{pose}")
+        if self.session.selection_camera is not None:
+            following = self.session.selection_cameras()
+            cams.append(f"выбрана машина — ведут {', '.join(following) or 'никто, жду её'}")
+        self.cams_line.configure(text="     ".join(cams))
 
     def _detector_note(self) -> str | None:
         """Режим детектора по описанию, устройство и мс; или почему он не включился."""
