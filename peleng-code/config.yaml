@@ -1,4 +1,4 @@
-active: truck_text
+active: motion
 predict_s: 0.5
 board:
   squares_x: 5

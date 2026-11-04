@@ -113,8 +113,8 @@ def scan_folder(root: Path) -> SceneFolder:
             camera_tables.append(path)
         elif kind == "track":
             track_tables.append(path)
-    _match(cameras, camera_tables, notes)
-    _name(cameras)
+    _match(cameras, camera_tables, notes, root)
+    _name(cameras, root)
 
     offsets = []
     for camera in cameras:
@@ -217,21 +217,51 @@ def video_motion_px(path: Path, pairs: int = 12, width: int = 640) -> float:
 # ---------------------------------------------------------------- разбор папки
 
 
-def _files(root: Path) -> tuple[list[Path], list[Path]]:
-    folders = [root] + sorted(
-        path for path in root.iterdir() if path.is_dir() and path.name.lower() not in _SKIP_DIRS
-    )
+def _files(root: Path, depth: int = 3) -> tuple[list[Path], list[Path]]:
+    """Видео и таблицы в папке и подпапках до depth уровней (Synthehicle: C01/out_rgb/video.mp4)."""
     videos, tables = [], []
-    for folder in folders:
+    folders = [(root, 0)]
+    while folders:
+        folder, level = folders.pop(0)
         for path in sorted(folder.iterdir()):
-            if not path.is_file() or path.name.lower().startswith(_SKIP_PREFIXES):
+            name = path.name.lower()
+            if path.is_dir():
+                if level < depth and name not in _SKIP_DIRS and not name.startswith("."):
+                    folders.append((path, level + 1))
+                continue
+            if not path.is_file() or name.startswith(_SKIP_PREFIXES):
                 continue
             suffix = path.suffix.lower()
             if suffix in VIDEO_SUFFIXES:
                 videos.append(path)
             elif suffix in TABLE_SUFFIXES:
                 tables.append(path)
+    tables += _synthehicle_calibration(root)
     return videos, tables
+
+
+def _synthehicle_calibration(root: Path) -> list[Path]:
+    """Сцена Synthehicle (Town04-O-day): калибровки лежат отдельно — calibration/overlapping/Town04."""
+    match = re.match(r"(Town\w+?)-([ON])-", root.name)
+    if match is None:
+        return []
+    kind = "overlapping" if match.group(2) == "O" else "non_overlapping"
+    for folder in [root, *root.parents]:
+        found = folder / "calibration" / kind / match.group(1) / "camera_info"
+        if found.is_dir():
+            return sorted(found.glob("camera_*.txt"))
+    return []
+
+
+def _label(camera: SceneCamera, root: Path | None = None) -> str:
+    """Имя ролика для сопоставления: путь от папки записи без расширения (C01/out_rgb/video)."""
+    path = camera.video.with_suffix("")
+    if root is not None:
+        try:
+            path = path.relative_to(root)
+        except ValueError:
+            pass
+    return path.as_posix() if root is not None else camera.video.stem
 
 
 def _probe(path: Path) -> tuple[int, int, int, float] | None:
@@ -275,11 +305,11 @@ def _tail_number(text: str) -> int | None:
     return int(found[-1]) if found else None
 
 
-def _match(cameras: list[SceneCamera], tables: list[Path], notes: list[str]) -> None:
+def _match(cameras: list[SceneCamera], tables: list[Path], notes: list[str], root: Path | None = None) -> None:
     free = list(tables)
     # 1. Имя таблицы целым словом в имени ролика; длинное имя важнее (Actor10 раньше Actor1).
     for camera in cameras:
-        hits = [table for table in free if _has_token(_key(table), camera.video.stem)]
+        hits = [table for table in free if _has_token(_key(table), _label(camera, root))]
         if hits:
             best = max(hits, key=lambda table: len(_key(table)))
             camera.table = best
@@ -287,7 +317,7 @@ def _match(cameras: list[SceneCamera], tables: list[Path], notes: list[str]) -> 
     # 2. По последнему числу в имени.
     left = [camera for camera in cameras if camera.table is None]
     for camera in left:
-        number = _tail_number(camera.video.stem)
+        number = _tail_number(_label(camera, root))
         if number is None:
             continue
         hits = [table for table in free if _tail_number(_key(table)) == number]
@@ -305,11 +335,11 @@ def _match(cameras: list[SceneCamera], tables: list[Path], notes: list[str]) -> 
         notes.append(f"таблица {table.name} без ролика")
 
 
-def _name(cameras: list[SceneCamera]) -> None:
+def _name(cameras: list[SceneCamera], root: Path | None = None) -> None:
     """cam-N по числу в имени таблицы или ролика; совпало — по порядку."""
     names = []
     for camera in cameras:
-        source = _key(camera.table) if camera.table is not None else camera.video.stem
+        source = _key(camera.table) if camera.table is not None else _label(camera, root)
         number = _tail_number(source)
         names.append(f"cam-{number}" if number is not None else None)
     if None in names or len(set(names)) != len(names):

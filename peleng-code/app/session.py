@@ -44,7 +44,24 @@ TRAIL_COAST = 5           # столько кадров без измерени�
 # отпускается после MATCH_LOSE_FRAMES кадров подряд с невязкой больше MATCH_KEEP_PX.
 MATCH_PICK_PX = 50.0
 MATCH_KEEP_PX = 90.0
-MATCH_LOSE_FRAMES = 15
+MATCH_LOSE_FRAMES = 8
+# Есть свежая 3D-точка выбранной (не старше MATCH_REF_S): та же машина на камере — трек у её
+# проекции, не дальше max(MATCH_NEAR_PX, 0,6 · размер рамки). Нет точки — по лучу, но только если
+# лучший кандидат в MATCH_UNIQUE раз лучше второго: на перекрёстке вдоль луча стоит очередь машин.
+MATCH_REF_S = 1.0
+MATCH_NEAR_PX = 30.0
+MATCH_UNIQUE = 2.0
+# Двусмысленность по лучу копится по кадрам (машины едут по-разному, чужая уходит с луча);
+# не разрешилась за MATCH_SETTLE кадров — берётся лучший по средней невязке.
+MATCH_SETTLE = 8
+
+
+def project_point(pose: CameraPose, xyz: np.ndarray) -> tuple[float, float] | None:
+    """Пиксель точки мира на камере; за камерой — None."""
+    pixels, depth = project_points(pose, np.asarray(xyz, np.float64).reshape(1, 3))
+    if float(depth[0]) <= 0.5:
+        return None
+    return float(pixels[0, 0]), float(pixels[0, 1])
 
 
 @dataclass
@@ -72,6 +89,8 @@ class Session:
         # Машина, выбранная оператором: камера, где её выбрали, и счётчики несогласия других камер.
         self.selection_camera: str | None = None
         self._mismatch: dict[str, int] = {}
+        self._selection_ref: tuple[np.ndarray, float] | None = None
+        self._evidence: dict[str, dict] = {}
         self.tracks3d: list[Track3D] = [Track3D(profile)]
         self.track3d = self.tracks3d[0]
         self.trail3d: deque[np.ndarray] = deque(maxlen=4000)
@@ -116,6 +135,8 @@ class Session:
         self.moving_pose_ids = {"cam-5"}
         self.selection_camera = None
         self._mismatch = {}
+        self._selection_ref = None
+        self._evidence = {}
         self.tracks3d = [Track3D(self.profile)]
         self.track3d = self.tracks3d[0]
         self.trail3d.clear()
@@ -143,6 +164,8 @@ class Session:
                 other.clear_selection()
         self.selection_camera = camera_id
         self._mismatch = {}
+        self._selection_ref = None
+        self._evidence = {}
         self.tracks3d = [Track3D(self.profile)]
         self.track3d = self.tracks3d[0]
         self.trail3d.clear()
@@ -155,6 +178,8 @@ class Session:
             pipeline.clear_selection()
         self.selection_camera = None
         self._mismatch = {}
+        self._selection_ref = None
+        self._evidence = {}
 
     def selection_cameras(self) -> list[str]:
         """Камеры, которые сейчас ведут выбранную машину."""
@@ -171,7 +196,7 @@ class Session:
         )
 
     def _match_selection(self, steps: list[Step]) -> None:
-        """Та же машина на других камерах: трек, чья точка сходится с выбранной по геометрии."""
+        """Та же машина на других камерах: у проекции её 3D-точки, а пока точки нет — по лучу."""
         if self.selection_camera is None:
             return
         by_id = {step.frame.camera_id: step for step in steps}
@@ -180,6 +205,9 @@ class Session:
         if anchor is None or pose_a is None or not anchor.selected:
             return
         pixel_a = (anchor.track.cx, anchor.track.cy)
+        reference = None
+        if self._selection_ref is not None and anchor.frame.time_s - self._selection_ref[1] <= MATCH_REF_S:
+            reference = self._selection_ref[0]
         for pipeline in self.pipelines:
             camera_id = getattr(pipeline.source, "camera_id", None)
             pose_b = self.poses.get(camera_id) if camera_id is not None else None
@@ -187,24 +215,61 @@ class Session:
                 continue
             tracker = pipeline.tracker
             if tracker.has_target:
-                step = by_id[camera_id]
-                error = self._pair_error(pose_a, pixel_a, pose_b, (step.track.cx, step.track.cy))
-                bad = error is None or error > MATCH_KEEP_PX
+                track = by_id[camera_id].track
+                bad = self._match_score(pose_a, pixel_a, pose_b, track, reference, loose=True) is None
                 self._mismatch[camera_id] = self._mismatch.get(camera_id, 0) + 1 if bad else 0
                 if self._mismatch[camera_id] < MATCH_LOSE_FRAMES:
                     continue
                 # Долго не сходится с выбранной — это другая машина: ищем заново.
                 tracker.clear_selection()
                 self._mismatch[camera_id] = 0
-            best: tuple[float, int] | None = None
-            for index, view in enumerate(tracker.tracks):
+            items = tracker.track_items
+            scored = []
+            for track, view in items:
                 if not view.active:
                     continue
-                error = self._pair_error(pose_a, pixel_a, pose_b, (view.cx, view.cy))
-                if error is not None and error <= MATCH_PICK_PX and (best is None or error < best[0]):
-                    best = (error, index)
-            if best is not None:
-                tracker.select_index(best[1])
+                score = self._match_score(pose_a, pixel_a, pose_b, view, reference)
+                if score is not None:
+                    scored.append((score, id(track), track))
+            if not scored:
+                continue
+            scored.sort(key=lambda item: item[0])
+            if reference is not None or len(scored) == 1:
+                tracker.select_track(scored[0][2])
+                self._evidence.pop(camera_id, None)
+                continue
+            # Несколько машин на луче выбранной: копим невязку каждого трека по кадрам.
+            history = self._evidence.setdefault(camera_id, {})
+            alive = {key for _, key, _ in scored}
+            for key in list(history):
+                if key not in alive:
+                    del history[key]
+            for score, key, track in scored:
+                errors = history.setdefault(key, [track, []])[1]
+                errors.append(score)
+                del errors[:-MATCH_SETTLE]
+            ranked = sorted(history.values(), key=lambda item: float(np.mean(item[1])))
+            best_track, best_errors = ranked[0]
+            best_mean = float(np.mean(best_errors))
+            second_mean = float(np.mean(ranked[1][1])) if len(ranked) > 1 else float("inf")
+            settled = len(best_errors) >= MATCH_SETTLE
+            if (len(best_errors) >= 3 and second_mean >= MATCH_UNIQUE * best_mean + 5.0) or settled:
+                tracker.select_track(best_track)
+                self._evidence.pop(camera_id, None)
+
+    def _match_score(self, pose_a, pixel_a, pose_b, view, reference, loose: bool = False) -> float | None:
+        """Насколько трек камеры B похож на выбранную машину, px; не похож — None."""
+        widen = 1.6 if loose else 1.0
+        if reference is not None:
+            pixel = project_point(pose_b, reference)
+            if pixel is None:
+                return None
+            size = max(view.bbox[2], view.bbox[3]) if view.bbox is not None else 0.0
+            distance = float(np.hypot(view.cx - pixel[0], view.cy - pixel[1]))
+            return distance if distance <= widen * max(MATCH_NEAR_PX, 0.6 * size) else None
+        error = self._pair_error(pose_a, pixel_a, pose_b, (view.cx, view.cy))
+        limit = MATCH_KEEP_PX if loose else MATCH_PICK_PX
+        return error if error is not None and error <= limit else None
 
     def _pair_error(self, pose_a: CameraPose, pixel_a, pose_b: CameraPose, pixel_b) -> float | None:
         """Невязка репроекции точки по двум камерам, px. Точка вне дальности профиля — None."""
@@ -267,6 +332,8 @@ class Session:
         self._match_selection(steps)
         world, rays = self._fuse(steps)
         if world.fresh and world.xyz is not None:
+            if self.selection_camera is not None:
+                self._selection_ref = (world.xyz.copy(), max(step.frame.time_s for step in steps))
             self.trail3d.append(world.xyz.copy())
             index = steps[0].frame.index
             if index is not None:
@@ -444,6 +511,7 @@ class Session:
         poses = []
         pixels = []
         times = []
+        ids = []
         for step in steps:
             if not step.track.measured or step.detection is None:
                 continue
@@ -456,6 +524,17 @@ class Session:
             poses.append(pose)
             pixels.append((step.detection.cx, step.detection.cy))
             times.append(step.frame.time_s)
+            ids.append(step.frame.camera_id)
+        if self.selection_camera in ids and len(ids) > 2:
+            # Камера с ошибочно выбранной чужой машиной не должна сорвать всю точку.
+            a = ids.index(self.selection_camera)
+            keep = [
+                i for i in range(len(ids))
+                if i == a or (self._pair_error(poses[a], pixels[a], poses[i], pixels[i]) or 1e9) <= MATCH_KEEP_PX
+            ]
+            poses = [poses[i] for i in keep]
+            pixels = [pixels[i] for i in keep]
+            times = [times[i] for i in keep]
         span = max(times) - min(times) if times else 0.0
         # Дальняя трасса: центры 2D шумнее, допуск репроекции шире.
         reproj = 60.0 if self.profile.v_max > 20.0 else 40.0

@@ -140,13 +140,15 @@ class CrossCameraMatchTest(unittest.TestCase):
             tick(index)
         chosen = _pixel(poses["A"], cars[0] + [0.6, 0, 0])
         self.assertTrue(session.select_target("A", *chosen))
-        for index in range(3, 6):
+        # Другая машина почти на луче выбранной (невязка ~3 px): выбор не сразу, а после
+        # накопления невязки по кадрам — и именно нужная машина.
+        for index in range(3, 15):
             steps = tick(index)
             session._match_selection(steps)
-        steps = tick(6)
+        steps = tick(15)
         by_id = {step.frame.camera_id: step for step in steps}
         self.assertTrue(by_id["B"].selected)
-        expected = _pixel(poses["B"], cars[0] + [1.8, 0, 0])
+        expected = _pixel(poses["B"], cars[0] + [4.5, 0, 0])
         self.assertLess(np.hypot(by_id["B"].track.cx - expected[0], by_id["B"].track.cy - expected[1]), 15)
         self.assertEqual(sorted(session.selection_cameras()), ["A", "B"])
         session.clear_target()

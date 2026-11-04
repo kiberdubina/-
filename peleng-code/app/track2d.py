@@ -483,6 +483,20 @@ class MultiTrack2D:
     def tracks(self) -> tuple[TrackView, ...]:
         return tuple(self._last_views)
 
+    @property
+    def track_items(self) -> list[tuple[Track2D, TrackView]]:
+        """Треки и их виды на последнем кадре: трек — постоянная личность между кадрами."""
+        if len(self._tracks) != len(self._last_views):
+            return []
+        return list(zip(self._tracks, self._last_views))
+
+    def select_track(self, track: Track2D) -> bool:
+        """Выбрать конкретный трек (той же машины на другой камере)."""
+        if track not in self._tracks or not track.ready:
+            return False
+        self._take(track)
+        return True
+
     def _idle_view(self) -> TrackView:
         return TrackView(
             False,

@@ -1,3 +1,4 @@
+import dataclasses
 from dataclasses import dataclass
 
 from app.motion import Detection
@@ -79,8 +80,14 @@ class Pipeline:
             else:
                 set_hint(None)
         spots = self.detector.detect(frame.image)
-        track = self.tracker.update(spots, frame.time_s)
-        self._last = track
+        if getattr(self.detector, "skipped", False) and self._last is not None:
+            # Детектор на этом кадре не запускался (det_every): это не пропуск цели — иначе
+            # неподтверждённый трек умирает на каждом таком кадре. Трек не трогаем, а шаг
+            # без измерения: в 3D старая рамка не попадёт.
+            track = dataclasses.replace(self._last, measured=False)
+        else:
+            track = self.tracker.update(spots, frame.time_s)
+            self._last = track
         all_tracks = list(self.tracker.tracks)
         extra = all_tracks if len(all_tracks) > 1 else None
         labels = getattr(self.detector, "labels", None)

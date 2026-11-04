@@ -308,6 +308,19 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual(saved["red_car"]["mode"], "object")
         self.assertEqual(len(saved["red_car"]["color"]), 2)
 
+    def test_saving_keeps_crlf(self):
+        from app.profile import save_active, save_pattern
+
+        self.config.write_bytes(self.config.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+        lines = self.config.read_bytes().count(b"\r\n")
+        save_active(self.config, "red_car", 0.5)
+        data = self.config.read_bytes()
+        self.assertEqual(data.count(b"\r\n"), lines)
+        self.assertEqual(data.count(b"\n"), lines)
+        save_pattern(self.config, "text_custom", {"mode": "text", "query": "car"}, 0.5)
+        data = self.config.read_bytes()
+        self.assertEqual(data.count(b"\n"), data.count(b"\r\n"))
+
     def test_save_pattern_makes_text_profile(self):
         from app.profile import load_patterns, save_pattern
 

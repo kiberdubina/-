@@ -101,6 +101,34 @@ class SceneFolderTest(unittest.TestCase):
         self.assertTrue(scene.has_poses)
         self.assertTrue(any("не открылся" in note for note in scene.notes))
 
+    def test_synthehicle_layout(self):
+        import json
+
+        calib = self.root / "calibration" / "overlapping" / "Town04" / "camera_info"
+        calib.mkdir(parents=True)
+        for number, x in ((1, 0.0), (2, 40.0)):
+            extrinsic = np.eye(4)
+            extrinsic[:3, 3] = [-x, 0.0, -6.0]  # мир→камера: центр (x, 0, 6), смотрит вдоль X Unreal
+            (calib / f"camera_{number}.txt").write_text(json.dumps({
+                "intrinsic_matrix": [[960.0, 0, 960.0], [0, 960.0, 540.0], [0, 0, 1]],
+                "extrinsic_matrix": extrinsic.tolist(), "x": x, "y": 0.0, "z": 6.0,
+            }))
+        scene = self.root / "train" / "Town04-O-day"
+        for camera in ("C01", "C02"):
+            (scene / camera / "out_rgb").mkdir(parents=True)
+            _video(scene / camera / "out_rgb" / "video.mp4")
+            (scene / camera / "gt").mkdir()
+            (scene / camera / "gt" / "gt.txt").write_text("1,7,100,200,50,40,1,-1,-1,-1\n")
+        found = scan_folder(scene)
+        pairs = {camera.video.parent.parent.name: camera.table.name for camera in found.cameras}
+        self.assertEqual(pairs, {"C01": "camera_1.txt", "C02": "camera_2.txt"})
+        self.assertTrue(found.has_poses)
+        self.assertEqual([camera.camera_id for camera in found.cameras], ["cam-1", "cam-2"])
+        self.assertFalse(any("gt.txt" in note for note in found.notes))
+        pose = scene_poses(found)["cam-2"](0)
+        rotation, _ = cv2.Rodrigues(pose.rvec)
+        self.assertTrue(np.allclose((-rotation.T @ pose.tvec).ravel(), [40.0, 0.0, 6.0]))
+
     def test_empty_folder(self):
         scene = scan_folder(self.root)
         self.assertEqual(scene.cameras, [])

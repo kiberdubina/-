@@ -1,3 +1,4 @@
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -149,6 +150,8 @@ def camera_motion(path: Path) -> tuple[float, float]:
 def table_kind(path: Path) -> str | None:
     """«camera» — поза камеры (есть углы), «track» — путь цели (только координаты), иначе None."""
     try:
+        if _calibration_json(Path(path)) is not None:
+            return "camera"
         lines = _lines(Path(path))
     except Exception:
         return None
@@ -159,17 +162,57 @@ def table_kind(path: Path) -> str | None:
         return "camera"
     if "loc" in header:
         return "track"
-    # Таблица без шапки: по числу чисел в первой строке.
+    # Таблица без шапки: по числу чисел в первой строке. Ровно 7 — поза, ровно 4 — путь;
+    # разметка MOT (10 чисел: кадр, id, рамка…) — ни то ни другое.
     cells = [cell for cell in lines[0].split(_delimiter(lines[0])) if cell.strip()]
     try:
-        [_number(cell) for cell in cells[:7]]
+        [_number(cell) for cell in cells]
     except ValueError:
         return None
-    if len(cells) >= 7:
+    if len(cells) == 7:
         return "camera"
-    if len(cells) >= 4:
+    if len(cells) == 4:
         return "track"
     return None
+
+
+def _calibration_json(path: Path) -> dict | None:
+    """Калибровка камеры CARLA (Synthehicle): JSON с intrinsic_matrix и extrinsic_matrix."""
+    if path.suffix.lower() not in (".txt", ".json") or path.stat().st_size > 100_000:
+        return None
+    text = path.read_text(encoding="utf-8", errors="replace").lstrip()
+    if not text.startswith("{"):
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    if "intrinsic_matrix" in data and "extrinsic_matrix" in data:
+        return data
+    return None
+
+
+def _read_calibration(data: dict) -> _Clip:
+    """Неподвижная камера CARLA. extrinsic — мир→камера в осях Unreal (вперёд, вправо, вверх),
+    метры. Мир программы — тот же Unreal со сменой знака Y (как у таблиц Way1), камера — OpenCV."""
+    K = np.asarray(data["intrinsic_matrix"], np.float64)
+    E = np.asarray(data["extrinsic_matrix"], np.float64)
+    flip = np.diag([1.0, -1.0, 1.0])
+    # Камера Unreal (вперёд, вправо, вверх) → OpenCV (вправо, вниз, вперёд).
+    to_cv = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, -1.0], [1.0, 0.0, 0.0]])
+    rotation = to_cv @ E[:3, :3] @ flip
+    tvec = to_cv @ E[:3, 3]
+    rvec, _ = cv2.Rodrigues(rotation)
+    center = -rotation.T @ tvec
+    # Матрица K задана для кадра 2·cx × 2·cy: фокус в тех же единицах, что ширина матрицы.
+    return _Clip(
+        centers=center.reshape(1, 3),
+        rvecs=rvec.reshape(1, 3),
+        tvecs=tvec.reshape(1, 3),
+        focal_mm=float(K[0, 0]),
+        sensor_w_mm=float(2.0 * K[0, 2]),
+        sensor_h_mm=float(2.0 * K[1, 2]) * float(K[0, 0]) / float(K[1, 1]),
+    )
 
 
 def _delimiter(header: str) -> str:
@@ -336,6 +379,9 @@ def _opencv_rotation(roll_deg: float, pitch_deg: float, yaw_deg: float) -> np.nd
 
 
 def _read_camera(path: Path) -> _Clip:
+    calibration = _calibration_json(Path(path))
+    if calibration is not None:
+        return _read_calibration(calibration)
     lines = _lines(path)
     if not lines:
         raise ValueError(f"{Path(path).name}: пустая таблица")
