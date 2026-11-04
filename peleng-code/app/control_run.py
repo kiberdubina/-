@@ -230,6 +230,10 @@ def apply_detector(config: ControlConfig, vehicle: dict | None, weights: str | N
         path = Path(__file__).resolve().parent.parent / path
     if not path.is_file():
         return f"нет весов детектора {path.name} — пятна по фону"
+    try:
+        import ultralytics  # noqa: F401
+    except ImportError:
+        return "нет пакета ultralytics (pip install -r requirements-detect.txt) — пятна по фону"
     config.detector_weights = str(path)
     config.detector_mode = mode or vehicle.get("detector_mode", "both")
     return f"детектор грузовика {path.name}, режим {config.detector_mode}"

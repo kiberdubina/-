@@ -86,6 +86,12 @@ class ControlDetectorTest(unittest.TestCase):
         self.assertIn("truck.pt", note)
         apply_detector(config, {"detector": str(self.weights)}, mode="detector")
         self.assertEqual(config.detector_mode, "detector")
+        # Веса есть, пакета нет — прогон по фону, а не падение.
+        bare = ControlConfig()
+        with mock.patch.dict(sys.modules, {"ultralytics": None}):
+            note = apply_detector(bare, {"detector": str(self.weights)})
+        self.assertIn("ultralytics", note)
+        self.assertIsNone(bare.detector_weights)
 
     def test_moving_camera_uses_detector_only(self):
         from app.control_run import clip_translates
