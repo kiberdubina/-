@@ -38,6 +38,13 @@ class _Clip:
     first_frame: int = 0
     last_frame: int = 0
     bad_rows: int = 0
+    # Фокус на каждом кадре, мм (колонка Focal_Length_mm, Way2). None — один focal_mm на всю запись.
+    focals: np.ndarray | None = None
+
+    def focal_at(self, frame: int) -> float:
+        if self.focals is None:
+            return self.focal_mm
+        return float(self.focals[_clamp(frame, len(self.focals))])
 
 
 def track_meters(root: Path) -> np.ndarray:
@@ -53,7 +60,7 @@ def pose_at(root: Path, camera_id: str, frame: int, width: int, height: int) -> 
         raise ValueError(f"неизвестная камера: {camera_id}")
     clip = _cached(root, filename, _read_camera)
     frame = _clamp(frame, int(clip.centers.shape[0]))
-    matrix = _intrinsics(clip.focal_mm, clip.sensor_w_mm, clip.sensor_h_mm, width, height)
+    matrix = _intrinsics(clip.focal_at(frame), clip.sensor_w_mm, clip.sensor_h_mm, width, height)
     return CameraPose(
         camera_id=camera_id,
         K=matrix,
@@ -120,7 +127,7 @@ def pose_in_table(path: Path, frame: int, width: int, height: int, camera_id: st
     """Поза камеры на кадре таблицы. Вне диапазона — крайний кадр."""
     clip = camera_table(path)
     frame = _clamp(frame, int(clip.centers.shape[0]))
-    matrix = _intrinsics(clip.focal_mm, clip.sensor_w_mm, clip.sensor_h_mm, width, height)
+    matrix = _intrinsics(clip.focal_at(frame), clip.sensor_w_mm, clip.sensor_h_mm, width, height)
     return CameraPose(
         camera_id=camera_id or Path(path).stem,
         K=matrix,
@@ -285,14 +292,26 @@ def _fill_gaps(values: np.ndarray) -> np.ndarray:
     return filled
 
 
-def _focal_mm(header: str) -> float:
+def _focal_column(header: str) -> tuple[float, int | None]:
+    """Фокус по шапке: (фокус на всю запись, номер колонки фокуса по кадрам или None).
+
+    Way1: «…;Focal length;35» — число в шапке рядом с подписью, одно на запись.
+    Way2: «…;Focal_Length_mm» — колонка, фокус в каждой строке (у камер разный: 25, 35, 50, 60 мм).
+    """
     cells = header.split(_delimiter(header))
     for index, cell in enumerate(cells):
-        if cell.strip().lower() != "focal length":
+        name = cell.strip().lower().replace("_", " ")
+        if name.endswith(" mm"):
+            name = name[:-3].strip()
+        if name != "focal length":
             continue
         if index + 1 < len(cells) and cells[index + 1].strip():
-            return _number(cells[index + 1])
-    return _FOCAL_MM
+            try:
+                return _number(cells[index + 1]), None
+            except ValueError:
+                pass
+        return _FOCAL_MM, index
+    return _FOCAL_MM, None
 
 
 def _sensor_mm(line: str) -> tuple[float, float]:
@@ -386,10 +405,11 @@ def _read_camera(path: Path) -> _Clip:
     if not lines:
         raise ValueError(f"{Path(path).name}: пустая таблица")
     delimiter = _delimiter(lines[0])
-    focal = _focal_mm(lines[0])
+    focal, focal_column = _focal_column(lines[0])
     sensor_w, sensor_h = _sensor_mm(lines[1]) if len(lines) > 1 else (_SENSOR_W_MM, _SENSOR_H_MM)
-    # Кадр → (центр в метрах, углы Unreal). Битая строка (Excel записал число датой) пропускается.
-    rows: dict[int, tuple[np.ndarray, tuple[float, float, float]]] = {}
+    # Кадр → (центр в метрах, углы Unreal, фокус строки). Битая строка (Excel записал число датой)
+    # пропускается; битый фокус — NaN, его заполнят соседние кадры.
+    rows: dict[int, tuple[np.ndarray, tuple[float, float, float], float]] = {}
     bad = 0
     for line in lines:
         cells = line.split(delimiter)
@@ -414,7 +434,10 @@ def _read_camera(path: Path) -> _Clip:
         if not (np.isfinite(center).all() and np.isfinite(angles).all()):
             bad += 1
             continue
-        rows[frame] = (center, angles)
+        row_focal = float("nan")
+        if focal_column is not None and focal_column < len(cells):
+            row_focal = _maybe_number(cells[focal_column])
+        rows[frame] = (center, angles, row_focal if row_focal > 0 else float("nan"))
     if not rows:
         raise ValueError(f"{Path(path).name}: нет ни одной строки позы")
     known = np.array(sorted(rows), np.int64)
@@ -438,6 +461,13 @@ def _read_camera(path: Path) -> _Clip:
         rotation, rvec = cache[angles]
         rvecs[frame] = rvec
         tvecs[frame] = -rotation @ centers[frame]
+    focals = None
+    known_focals = np.array([rows[int(frame)][2] for frame in known], np.float64)
+    good = np.isfinite(known_focals)
+    if good.any():
+        # Фокус по кадрам: пропуск — по соседним кадрам (наезд камеры меняется плавно).
+        focals = np.interp(index, known[good], known_focals[good])
+        focal = float(focals[int(known[0])])
     return _Clip(
         centers=centers,
         rvecs=rvecs,
@@ -448,6 +478,7 @@ def _read_camera(path: Path) -> _Clip:
         first_frame=int(known[0]),
         last_frame=int(known[-1]),
         bad_rows=bad,
+        focals=focals,
     )
 
 

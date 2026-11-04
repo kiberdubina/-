@@ -39,6 +39,7 @@ from app.vehicle import (
     anchor_point,
     box_center,
     box_corners,
+    flipped,
     project_points,
     wrap_angle,
 )
@@ -333,6 +334,34 @@ def fuse(
     return fusion, observed
 
 
+# Задним ходом быстрее этого фура не ездит: дольше REVERSE_HOLD_S — перепутан перед ящика.
+REVERSE_M_S = 1.0
+REVERSE_HOLD_S = 0.3
+
+
+def orient_forward(states: dict[int, np.ndarray], model: VehicleModel, fps: float) -> dict[int, np.ndarray]:
+    """Участки, где ящик долго едет задом, разворачиваются на пол-оборота вокруг центра.
+
+    Фильтр разворачивает гипотезу сам, но сглаживание и итерации по направляющей тянут
+    перевёрнутый курс дальше: опорная точка Way1 (15 м перед задней осью) уезжает на ~22 м.
+    """
+    keys = sorted(states)
+    result = {key: states[key] for key in keys}
+    hold = max(1, int(round(REVERSE_HOLD_S * fps)))
+    run: list[int] = []
+    for key in keys + [None]:
+        backward = key is not None and float(states[key][V]) < -REVERSE_M_S
+        consecutive = bool(run) and key is not None and key == run[-1] + 1
+        if backward and (consecutive or not run):
+            run.append(key)
+            continue
+        if len(run) >= hold:
+            for frame in run:
+                result[frame] = flipped(states[frame], model)
+        run = [key] if backward else []
+    return result
+
+
 def blend_states(before: dict, after: dict, share: float) -> dict:
     """(1 − share)·before + share·after по кадрам; курс усредняется по окружности.
     Кадры, которые есть только в одной траектории, берутся из неё."""
@@ -379,11 +408,12 @@ def refine(
     траекторией прошлой итерации (она уже учла всю запись), затем заново фильтрует и
     сглаживает. Останов — когда траектория перестала меняться.
     """
-    previous = fusion.smoothed_states()
+    fps = clips[0].fps
+    previous = orient_forward(fusion.smoothed_states(), model, fps)
     guide = previous
     for round_number in range(config.refine if rounds is None else rounds):
         fusion, observed = fuse(clips, blobs, model, config, None, guide)
-        current = fusion.smoothed_states()
+        current = orient_forward(fusion.smoothed_states(), model, fps)
         change = trajectory_change(model, previous, current)
         # Нижняя релаксация: следующая направляющая — середина двух последних траекторий.
         # Дискретные решения «пятно взято / не взято» иначе раскачивают итерации в цикл.
@@ -430,7 +460,7 @@ def run_control(
         )
         exclude = fusion.smoothed_states()
     assert fusion is not None
-    states = fusion.smoothed_states()
+    states = orient_forward(fusion.smoothed_states(), model, clips[0].fps)
     filtered = fusion.filtered_states()
     frames = supported_frames(sorted(states), observed, config.coast_frames)
     count = min(clip.frames for clip in clips)

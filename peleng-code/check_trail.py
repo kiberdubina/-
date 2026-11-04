@@ -1,6 +1,17 @@
-"""След мяча без выброса и прогноз на 0,5 с. Запуск: python check_trail.py"""
+"""След мяча без выброса и прогноз на 0,5 с. Запуск: python check_trail.py [--video РОЛИК]
 
+Сначала ворота Track2D на искусственных измерениях. Затем ролик с мячом проходит Pipeline
+дважды — по цвету и по движению: рамка держится (не меньше 80 измерений), центр не прыгает
+дальше 140 px за кадр, прогноз идёт по скорости, след не поднимается выше пути мяча.
+
+Исходный ролик video_2026-11-01_22-06-07.mp4 снимался у участника и в репозиторий не попал
+(*.mp4 в .gitignore). Нет его и не задан --video — ролик с известной правдой из _synthetic_clips.py.
+Профиль — green_ball с горизонтом 0,5 с, а не активный профиль config.yaml.
+"""
+
+import argparse
 import sys
+import tempfile
 from dataclasses import replace
 from pathlib import Path
 
@@ -8,13 +19,23 @@ import numpy as np
 
 from app.motion import Detection
 from app.pipeline import Pipeline
-from app.profile import load_profile
+from app.profile import load_patterns
 from app.source import VideoSource
 from app.track2d import Track2D
 
 ROOT = Path(__file__).resolve().parent
 VIDEO = ROOT / "video_2026-11-01_22-06-07.mp4"
 MAX_JUMP_PX = 140.0
+HORIZON_S = 0.5
+# Ложный центр на исходном ролике был около y=160–270, настоящий верх маха мяча — ниже.
+VIDEO_TOP_Y = 280.0
+# На ролике с известной правдой след не выше верха пути мяча с этим запасом.
+TOP_MARGIN_PX = 40.0
+
+
+def ball_profile():
+    """Профиль мяча с горизонтом прогноза проверки (в config.yaml горизонт меняется кнопками)."""
+    return replace(load_patterns(ROOT / "config.yaml")["green_ball"], predict_s=HORIZON_S)
 
 
 def _blob(x: float, y: float, area: float = 30000.0) -> Detection:
@@ -22,9 +43,8 @@ def _blob(x: float, y: float, area: float = 30000.0) -> Detection:
 
 
 def check_gate() -> None:
-    profile = load_profile(ROOT / "config.yaml")
+    profile = ball_profile()
     tracker = Track2D(profile)
-    assert profile.predict_s == 0.5
     tracker.update([_blob(100, 200)], 0.0)
     view = None
     for index in range(1, 8):
@@ -56,8 +76,9 @@ def check_gate() -> None:
     assert abs((view.pred_cy - view.cy) - view.vy * 0.25) < 1e-3
 
 
-def _run_video(profile, label: str) -> None:
-    source = VideoSource(str(VIDEO), "file")
+def _run_video(profile, label: str, video: Path, top_y: float | None) -> None:
+    """top_y — выше этой строки след подниматься не должен; None — правды нет, не проверяется."""
+    source = VideoSource(str(video), "file")
     pipeline = Pipeline(profile, source)
     previous: tuple[int, float, float] | None = None
     max_jump = 0.0
@@ -102,21 +123,37 @@ def _run_video(profile, label: str) -> None:
         raise SystemExit(f"{label}: скачок {max_jump:.1f} px выше {MAX_JUMP_PX:.0f}")
     if ahead < 10:
         raise SystemExit(f"{label}: прогноз почти не проверен")
-    # Ложный центр на этом ролике был около y=160–270 и сразу возвращался.
-    # Настоящий верх маха мяча остаётся ниже.
-    if min_y < 280:
-        raise SystemExit(f"{label}: след поднялся до y={min_y:.0f}")
+    # Ложный центр уводит след вверх, к руке, и сразу возвращается.
+    if top_y is not None and min_y < top_y:
+        raise SystemExit(f"{label}: след поднялся до y={min_y:.0f}, выше y={top_y:.0f}")
 
 
-def main() -> None:
-    if not VIDEO.is_file():
-        raise SystemExit(f"нет ролика {VIDEO.name}")
-    check_gate()
-    profile = load_profile(ROOT / "config.yaml")
-    _run_video(profile, "цвет")
+def check_video(video: Path, top_y: float | None) -> None:
+    profile = ball_profile()
+    _run_video(profile, "цвет", video, top_y)
     motion = replace(profile, color=None, s_min=20000, s_max=90000)
-    _run_video(motion, "движение")
-    print("след без выброса, прогноз 0.5 с")
+    _run_video(motion, "движение", video, top_y)
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="След мяча без выброса и прогноз на 0,5 с")
+    parser.add_argument("--video", type=Path, help="свой ролик с зелёным мячом (верх следа не проверяется)")
+    args = parser.parse_args(argv)
+    check_gate()
+    if args.video is not None:
+        if not args.video.is_file():
+            raise SystemExit(f"нет ролика {args.video}")
+        check_video(args.video, None)
+    elif VIDEO.is_file():
+        check_video(VIDEO, VIDEO_TOP_Y)
+    else:
+        from _synthetic_clips import green_ball
+
+        print(f"нет ролика {VIDEO.name} — синтетический мяч с известной правдой (_synthetic_clips.py)")
+        with tempfile.TemporaryDirectory() as folder:
+            clip = green_ball(Path(folder))
+            check_video(clip.path, float(clip.truth[:, 1].min()) - TOP_MARGIN_PX)
+    print(f"след без выброса, прогноз {HORIZON_S:g} с")
 
 
 if __name__ == "__main__":
