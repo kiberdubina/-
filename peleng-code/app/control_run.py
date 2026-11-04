@@ -71,6 +71,9 @@ class ControlConfig:
     exclude_pad_px: int = 30       # запас вокруг проекции ящика при исключении из фона, px
     video_width: int = 960         # ширина кадров в видео результата
     workers: int = 5               # потоков на камеры
+    # Кадр дальше этого от ближайшего наблюдения цели (хоть одной камерой) — дыра, а не
+    # точка: без наблюдений трек летит по инерции и уходит на десятки метров. None — все кадры.
+    coast_frames: int | None = 15
     background: BackgroundConfig = field(default_factory=BackgroundConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
 
@@ -116,6 +119,21 @@ def way1_clips(root: Path) -> list[CameraClip]:
         capture.release()
         poses = TablePose(str(Path(root).resolve()), camera_id, width, height)
         clips.append(CameraClip(camera_id, path, width, height, count, fps, poses))
+    return clips
+
+
+def scene_clips(scene) -> list[CameraClip]:
+    """Камеры любой папки (app.scene_folder.SceneFolder) с таблицами поз — для контрольного прогона."""
+    from app.scene_folder import FilePose
+
+    clips = []
+    for camera in scene.cameras:
+        if camera.table is None:
+            continue
+        poses = FilePose(str(camera.table), scene.frame_offset, camera.width, camera.height, camera.camera_id)
+        clips.append(
+            CameraClip(camera.camera_id, camera.video, camera.width, camera.height, camera.frames, camera.fps, poses)
+        )
     return clips
 
 
@@ -325,7 +343,7 @@ def run_control(
     assert fusion is not None
     states = fusion.smoothed_states()
     filtered = fusion.filtered_states()
-    frames = sorted(states)
+    frames = supported_frames(sorted(states), observed, config.coast_frames)
     count = min(clip.frames for clip in clips)
 
     files: dict[str, Path] = {}
@@ -340,6 +358,11 @@ def run_control(
         files["report"] = write_metrics_report(stats, out_dir / "metrics.txt")
         files["segments"] = write_segment_table(out_dir / "metrics_by_segment.csv", frames, anchors, truth)
         (out_dir / "metrics.json").write_text(json.dumps(stats, ensure_ascii=False, indent=1), encoding="utf-8")
+    from app.excel_export import control_workbook
+
+    workbook = control_workbook(out_dir / "trajectory.xlsx", files, stats)
+    if workbook is not None:
+        files["xlsx"] = workbook
     say("графики", 0.0)
     files.update(write_charts(out_dir, frames, states, model, clips[0].fps, truth))
     say("видео", 0.0)
@@ -349,6 +372,22 @@ def run_control(
 
 
 # ---------------------------------------------------------------- вывод
+
+
+def supported_frames(frames: list[int], observed: dict[int, dict], coast: int | None) -> list[int]:
+    """Кадры не дальше coast от ближайшего кадра, где цель видела хоть одна камера."""
+    if coast is None:
+        return list(frames)
+    seen = np.array(sorted(frame for frame in frames if observed.get(frame)), np.int64)
+    if not len(seen):
+        return []
+    keep = []
+    for frame in frames:
+        index = int(np.searchsorted(seen, frame))
+        near = min(abs(int(seen[min(index, len(seen) - 1)]) - frame), abs(int(seen[max(index - 1, 0)]) - frame))
+        if near <= coast:
+            keep.append(frame)
+    return keep
 
 
 def write_trajectory(

@@ -85,6 +85,24 @@ class StaticBackgroundTest(unittest.TestCase):
         brighter = np.clip(scene.astype(np.float32) * 1.25, 0, 255).astype(np.uint8)
         self.assertLess(model.apply(brighter).mean(), 0.01)
 
+    def test_hold_keeps_still_target_out_of_background(self) -> None:
+        # Цель, что едет на камеру, почти не меняет пиксели: без hold она «призрак» и уходит в фон.
+        scene = textured(2)
+        frame = scene.copy()
+        cv2.rectangle(frame, (100, 60), (160, 120), (20, 30, 220), -1)
+        hold = np.zeros((H, W), bool)
+        hold[50:130, 90:170] = True
+        held = StaticBackground(W, H, CONFIG)
+        plain = StaticBackground(W, H, CONFIG)
+        for _ in range(10):
+            held.apply(scene)
+            plain.apply(scene)
+        for _ in range(CONFIG.ghost_frames + 10):
+            held_mask = held.apply(frame, hold=hold)
+            plain_mask = plain.apply(frame)
+        self.assertGreater(held_mask[60:120, 100:160].mean(), 0.9)
+        self.assertLess(plain_mask[60:120, 100:160].mean(), 0.1)
+
 
 class RotatingBackgroundTest(unittest.TestCase):
     def test_pure_rotation_gives_no_foreground(self) -> None:

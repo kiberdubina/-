@@ -2,6 +2,9 @@
 
 Ролики и таблицы ищутся в корне проекта и в подпапках (видео/, execl/ …).
 Результат: reports/way1_control/ — trajectory.csv, metrics.txt, графики, видео.
+
+Любая другая запись: python run_control.py --folder ПАПКА_С_РОЛИКАМИ
+Ролики и таблицы поз с любыми именами (app/scene_folder.py), отчёт — reports/<папка>_control/.
 """
 
 import argparse
@@ -23,6 +26,7 @@ def main() -> int:
     parser.add_argument("out", nargs="?", default=str(ROOT / "reports" / "way1_control"))
     parser.add_argument("--passes", type=int, default=2)
     parser.add_argument("--workers", type=int, default=5)
+    parser.add_argument("--folder", help="папка с роликами и таблицами поз любой записи")
     args = parser.parse_args()
 
     profile = load_patterns(ROOT / "config.yaml")["way1"]
@@ -30,8 +34,22 @@ def main() -> int:
         print("В профиле way1 нет блока vehicle (габарит цели).")
         return 1
     model = VehicleModel.from_config(profile.vehicle)
-    clips = way1_clips(ROOT)
-    truth = track_meters(ROOT)
+    if args.folder:
+        from app.control_run import scene_clips
+        from app.scene_folder import describe, scan_folder, scene_truth
+
+        scene = scan_folder(Path(args.folder))
+        print(describe(scene))
+        clips = scene_clips(scene)
+        if len(clips) < 2:
+            print("Для 3D нужны минимум 2 ролика с таблицами поз.")
+            return 1
+        truth = scene_truth(scene)
+        if args.out == parser.get_default("out"):
+            args.out = str(ROOT / "reports" / f"{_safe(scene.root.name)}_control")
+    else:
+        clips = way1_clips(ROOT)
+        truth = track_meters(ROOT)
     config = ControlConfig(passes=args.passes, workers=args.workers)
     config.fusion.range_m = (profile.r_min, profile.r_max)
     started = time.perf_counter()
@@ -54,6 +72,12 @@ def main() -> int:
         print(f"{name}: {path}")
     print(f"Время: {time.perf_counter() - started:.0f} с")
     return 0
+
+
+def _safe(name: str) -> str:
+    """Имя папки отчёта без символов, которые не любит Windows."""
+    cleaned = "".join("_" if char in '<>:"/\\|?* ' else char for char in name).strip("._")
+    return cleaned or "scene"
 
 
 if __name__ == "__main__":

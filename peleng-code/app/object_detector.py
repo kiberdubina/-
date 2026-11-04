@@ -387,6 +387,7 @@ class ObjectDetector:
         self.device = getattr(self.model, "device", "cpu")
         self.ms = 0.0
         self.calls = 0
+        self.skipped = False
         self._state = _State()
 
     @property
@@ -402,8 +403,9 @@ class ObjectDetector:
         state = self._state
         run = state.tick % self.spec.det_every == 0
         state.tick += 1
+        # Кадр без запуска модели — не «цель пропала», а «данных нет»: Pipeline трек не трогает.
+        self.skipped = not run
         if not run:
-            # Между запусками рамку ведёт 2D-Калман: трек переживает пропуски.
             return []
         roi = None if state.roi_failed else self._roi(image.shape[1], image.shape[0])
         if roi is not None:
@@ -417,7 +419,8 @@ class ObjectDetector:
 
     def _roi(self, width: int, height: int) -> tuple[int, int, int, int] | None:
         hint = self._state.hint
-        if hint is None:
+        # roi_scale ≤ 0 — всегда весь кадр: в потоке машин нужны все, а не одна.
+        if hint is None or self.spec.roi_scale <= 0:
             return None
         cx, cy, w, h = hint
         half_w = max(w * self.spec.roi_scale, ROI_MIN_PX) / 2.0

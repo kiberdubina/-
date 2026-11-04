@@ -2,7 +2,6 @@
 
 from pathlib import Path
 
-# Порядок поиска. Видео и таблицы в git не хранятся, их кладут рядом руками.
 SUBDIRS = ("", "видео", "video", "videos", "execl", "excel", "tables", "data")
 
 

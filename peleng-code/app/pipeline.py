@@ -1,3 +1,4 @@
+import dataclasses
 from dataclasses import dataclass
 
 from app.motion import Detection
@@ -15,6 +16,8 @@ class Step:
     tracks: list[TrackView] | None = None
     # Цель по описанию: рамки модели с классом или запросом и уверенностью.
     labels: list[Label] | None = None
+    # Главный трек — машина, выбранная оператором (Shift+клик).
+    selected: bool = False
 
 
 class Pipeline:
@@ -23,13 +26,22 @@ class Pipeline:
         self.source = source
         # Детектор по описанию не собрался (нет пакета, весов) — текст для строки статуса.
         self.detector_error: str | None = None
+        # Камера поворачивается (Session знает её позы по кадрам): детектор движения — ego.
+        self.moving = False
         self.detector = self._make_detector()
         self.tracker = MultiTrack2D(profile)
         self._last: TrackView | None = None
 
     def _make_detector(self):
         detector, self.detector_error = build_detector(self.profile, self.profile.detect)
+        if hasattr(detector, "force_ego"):
+            detector.force_ego = self.moving
         return detector
+
+    def set_moving(self, moving: bool) -> None:
+        self.moving = bool(moving)
+        if hasattr(self.detector, "force_ego"):
+            self.detector.force_ego = self.moving
 
     def set_profile(self, profile: TargetProfile) -> None:
         described = self.profile.mode in DESCRIBED_MODES or profile.mode in DESCRIBED_MODES
@@ -68,9 +80,25 @@ class Pipeline:
             else:
                 set_hint(None)
         spots = self.detector.detect(frame.image)
-        track = self.tracker.update(spots, frame.time_s)
-        self._last = track
+        if getattr(self.detector, "skipped", False) and self._last is not None:
+            # Детектор на этом кадре не запускался (det_every): это не пропуск цели — иначе
+            # неподтверждённый трек умирает на каждом таком кадре. Трек не трогаем, а шаг
+            # без измерения: в 3D старая рамка не попадёт.
+            track = dataclasses.replace(self._last, measured=False)
+        else:
+            track = self.tracker.update(spots, frame.time_s)
+            self._last = track
         all_tracks = list(self.tracker.tracks)
         extra = all_tracks if len(all_tracks) > 1 else None
         labels = getattr(self.detector, "labels", None)
-        return Step(frame, self.tracker.accepted, track, extra, labels)
+        return Step(frame, self.tracker.accepted, track, extra, labels, self.tracker.has_target)
+
+    def select_at(self, x: float, y: float) -> bool:
+        """Оператор выбрал машину в точке кадра этой камеры."""
+        found = self.tracker.select_at(x, y)
+        if found:
+            self._last = None
+        return found
+
+    def clear_selection(self) -> None:
+        self.tracker.clear_selection()

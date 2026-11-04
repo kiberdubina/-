@@ -23,6 +23,9 @@ TRAIL_MIN_PX = 3.0
 VELOCITY_WINDOW = 4
 # Потолок живого допуска: даже на большой скорости сотни пикселей не проходят.
 GATE_CAP_PX = 280.0
+# Новый трек — только после стольких измерений подряд. Вспышка листвы, тени или шума
+# на кадр-другой не рисует рамку, след и прогноз и не идёт в 3D.
+CONFIRM_HITS = 3
 
 
 @dataclass
@@ -90,6 +93,7 @@ class Track2D:
             self.miss_limit = 12
         self.ready = False
         self.miss = 0
+        self.hits = 0
         self.last_t = 0.0
         self.accepted: Detection | None = None
         self.last_bbox: tuple[int, int, int, int] | None = None
@@ -111,6 +115,7 @@ class Track2D:
     def reset(self) -> None:
         self.ready = False
         self.miss = 0
+        self.hits = 0
         self.last_t = 0.0
         self.accepted = None
         self.last_bbox = None
@@ -133,6 +138,7 @@ class Track2D:
             self.ready = True
             self.last_t = time_s
             self.miss = 0
+            self.hits = 1
             self._remember(spot, time_s)
             return self._view("захват", True, spot)
 
@@ -146,8 +152,10 @@ class Track2D:
         spot = self._pick_gated(found, self._gate_radius(dt))
         if spot is None:
             self.miss += 1
-            if self.miss > self.miss_limit:
+            # Неподтверждённый трек пропуска не переживает: это была вспышка, не цель.
+            if self.miss > self.miss_limit or self.hits < CONFIRM_HITS:
                 self.ready = False
+                self.hits = 0
                 self.last_bbox = None
                 return self._idle()
             return self._view(None, False, None)
@@ -155,6 +163,7 @@ class Track2D:
         measure = np.array([[np.float32(spot.cx)], [np.float32(spot.cy)]])
         self.kf.correct(measure)
         self.miss = 0
+        self.hits += 1
         self._remember(spot, time_s)
         self._snap_filter(spot)
         return self._view(None, True, spot)
@@ -173,18 +182,23 @@ class Track2D:
         return max(self.gate_px, min(grown, GATE_CAP_PX))
 
     def _measure_velocity(self) -> tuple[float, float]:
-        """Скорость по последним четырём измерениям. Иначе — скорость фильтра."""
+        """Скорость по последним четырём измерениям. Иначе — скорость фильтра.
+
+        Медиана скоростей по всем парам точек (оценка Тейла–Сена): один скачок центра на
+        соседнее пятно её не раздувает, и прогноз не улетает. Прямая МНК — раздувала.
+        """
         if len(self.samples) >= VELOCITY_WINDOW:
             window = self.samples[-VELOCITY_WINDOW:]
-            times = np.array([sample[2] for sample in window], dtype=np.float64)
-            xs = np.array([sample[0] for sample in window], dtype=np.float64)
-            ys = np.array([sample[1] for sample in window], dtype=np.float64)
-            centered = times - float(times.mean())
-            denom = float(np.dot(centered, centered))
-            if denom > 1e-8:
-                vx = float(np.dot(centered, xs - float(xs.mean())) / denom)
-                vy = float(np.dot(centered, ys - float(ys.mean())) / denom)
-                return vx, vy
+            slopes_x = []
+            slopes_y = []
+            for first in range(len(window)):
+                for second in range(first + 1, len(window)):
+                    span = window[second][2] - window[first][2]
+                    if span > 1e-4:
+                        slopes_x.append((window[second][0] - window[first][0]) / span)
+                        slopes_y.append((window[second][1] - window[first][1]) / span)
+            if slopes_x:
+                return float(np.median(slopes_x)), float(np.median(slopes_y))
         return float(self.kf.statePost[2, 0]), float(self.kf.statePost[3, 0])
 
     def _snap_filter(self, spot: Detection) -> None:
@@ -261,7 +275,10 @@ class Track2D:
         speed = float(math.hypot(vx, vy))
         horizon = max(0.0, self.horizon_s)
         in_gate = self.profile.u_min <= speed <= self.profile.u_max
-        if state is None:
+        confirmed = self.hits >= CONFIRM_HITS
+        if not confirmed:
+            state = "проверка"
+        elif state is None:
             state = "сопровождение" if in_gate else "вне порога скорости"
         if spot is not None:
             bbox = spot.bbox
@@ -271,6 +288,9 @@ class Track2D:
             bbox = None
         pred_bbox = None if bbox is None else _shift_bbox(bbox, vx * horizon, vy * horizon)
         area = None if spot is None else spot.area
+        if not confirmed:
+            # Ещё не цель: без рамки, следа и прогноза на экране и без измерения для 3D.
+            return self._pack(False, cx, cy, vx, vy, state, False, False, None, None, area, horizon)
         return self._pack(
             True, cx, cy, vx, vy, state, in_gate, measured, bbox, pred_bbox, area, horizon
         )
@@ -323,6 +343,11 @@ def _as_spots(spots: list[Detection] | Detection | None) -> list[Detection]:
 MAX_TRACKS_2D = 8
 # Новый трек только если пятно не слишком далеко от уже ведущихся целей.
 SPAWN_NEAR_TRACK_PX = 420.0
+# Выбранная машина: клик попал в рамку или ближе этого к центру пятна.
+SELECT_NEAR_PX = 40.0
+# Выбранная потерялась: трек ближе этого к её последнему месту и не позже — она же.
+RELOCK_PX = 150.0
+RELOCK_S = 3.0
 
 
 class MultiTrack2D:
@@ -332,6 +357,67 @@ class MultiTrack2D:
         self._profile = profile
         self._tracks: list[Track2D] = []
         self._last_views: list[TrackView] = []
+        # Выбор машины оператором: главный трек закреплён за ней и не уходит на соседнюю.
+        self._locked = False
+        self._selected: Track2D | None = None
+        self._lost: tuple[float, float, float] | None = None  # x, y, время потери
+        self._last_spots: list[Detection] = []
+        self._last_time = 0.0
+
+    @property
+    def locked(self) -> bool:
+        """Оператор выбрал машину (даже если она сейчас потеряна)."""
+        return self._locked
+
+    @property
+    def has_target(self) -> bool:
+        """Выбранная машина сейчас ведётся."""
+        return self._locked and self._selected is not None
+
+    def select_at(self, x: float, y: float) -> bool:
+        """Выбрать машину под точкой кадра: трек с рамкой здесь или пятно последнего кадра."""
+        hit = None
+        for track in self._tracks:
+            if track.ready and _inside(track.last_bbox, x, y, track.last_cx, track.last_cy):
+                hit = track
+                break
+        if hit is None:
+            spot = next(
+                (spot for spot in self._last_spots if _inside(spot.bbox, x, y, spot.cx, spot.cy)),
+                None,
+            )
+            if spot is None:
+                return False
+            hit = Track2D(self._profile)
+            hit.update([spot], self._last_time)
+            if not hit.ready:
+                return False
+            self._tracks.insert(0, hit)
+            self._last_views.insert(0, hit.update([spot], self._last_time))
+        self._take(hit)
+        return True
+
+    def select_index(self, index: int) -> bool:
+        """Выбрать трек по номеру в tracks (для той же машины на другой камере)."""
+        ready = [track for track in self._tracks if track.ready]
+        if not 0 <= index < len(ready):
+            return False
+        self._take(ready[index])
+        return True
+
+    def clear_selection(self) -> None:
+        self._locked = False
+        self._selected = None
+        self._lost = None
+
+    def _take(self, track: Track2D) -> None:
+        index = self._tracks.index(track)
+        self._tracks.insert(0, self._tracks.pop(index))
+        if index < len(self._last_views):
+            self._last_views.insert(0, self._last_views.pop(index))
+        self._locked = True
+        self._selected = track
+        self._lost = None
 
     @property
     def profile(self) -> TargetProfile:
@@ -359,14 +445,57 @@ class MultiTrack2D:
     def reset(self) -> None:
         self._tracks.clear()
         self._last_views.clear()
+        self.clear_selection()
+        self._last_spots = []
 
     def update(self, spots: list[Detection] | Detection | None, time_s: float) -> TrackView:
+        self._last_spots = list(_as_spots(spots))
+        self._last_time = float(time_s)
         views = self._update_all(spots, time_s)
+        if self._locked:
+            self._follow_selected(time_s)
+            # Выбранная потеряна — главного трека нет: соседняя машина в 3D не попадёт.
+            if self._selected is None:
+                return self._idle_view()
+            return self._last_views[0]
         return views[0] if views else self._idle_view()
+
+    def _follow_selected(self, time_s: float) -> None:
+        if self._selected is not None and self._selected not in self._tracks:
+            self._lost = (self._selected.last_cx, self._selected.last_cy, float(time_s))
+            self._selected = None
+        if self._selected is None and self._lost is not None:
+            x, y, since = self._lost
+            if time_s - since <= RELOCK_S:
+                near = [
+                    track
+                    for track in self._tracks
+                    if track.ready and math.hypot(track.last_cx - x, track.last_cy - y) <= RELOCK_PX
+                ]
+                if near:
+                    best = min(near, key=lambda track: math.hypot(track.last_cx - x, track.last_cy - y))
+                    self._take(best)
+                    return
+        if self._selected is not None and self._tracks and self._tracks[0] is not self._selected:
+            self._take(self._selected)
 
     @property
     def tracks(self) -> tuple[TrackView, ...]:
         return tuple(self._last_views)
+
+    @property
+    def track_items(self) -> list[tuple[Track2D, TrackView]]:
+        """Треки и их виды на последнем кадре: трек — постоянная личность между кадрами."""
+        if len(self._tracks) != len(self._last_views):
+            return []
+        return list(zip(self._tracks, self._last_views))
+
+    def select_track(self, track: Track2D) -> bool:
+        """Выбрать конкретный трек (той же машины на другой камере)."""
+        if track not in self._tracks or not track.ready:
+            return False
+        self._take(track)
+        return True
 
     def _idle_view(self) -> TrackView:
         return TrackView(
@@ -389,6 +518,8 @@ class MultiTrack2D:
         )
 
     def _primary_track(self) -> Track2D | None:
+        if self._locked:
+            return self._selected
         for track in self._tracks:
             if track.ready:
                 return track
@@ -447,6 +578,9 @@ class MultiTrack2D:
             self._drop_spot(remaining, spot)
 
     def _should_spawn(self, spot: Detection) -> bool:
+        if self._locked:
+            # Поток машин: треки по всему кадру — выбранная могла вернуться где угодно.
+            return True
         ready = [track for track in self._tracks if track.ready]
         if not ready:
             return True
@@ -461,3 +595,12 @@ class MultiTrack2D:
             self._last_views = [idle]
             return [idle]
         return list(self._last_views)
+
+
+def _inside(bbox, x: float, y: float, cx: float, cy: float) -> bool:
+    """Точка в рамке или ближе SELECT_NEAR_PX к центру."""
+    if bbox is not None:
+        left, top, width, height = bbox
+        if left <= x <= left + width and top <= y <= top + height:
+            return True
+    return math.hypot(x - cx, y - cy) <= SELECT_NEAR_PX

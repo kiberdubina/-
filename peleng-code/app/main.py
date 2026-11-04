@@ -1,3 +1,5 @@
+import dataclasses
+import sys
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -128,6 +130,30 @@ def fit_camera_tile(
     return canvas
 
 
+def tile_to_image(
+    px: float,
+    py: float,
+    frame_w: int,
+    frame_h: int,
+    tile_w: int,
+    tile_h: int,
+    crop: tuple[int, int, int, int] | None = None,
+) -> tuple[float, float] | None:
+    """Точка окна камеры → пиксель полного кадра. Учитывает вписывание (fit_camera_tile)
+    и приближение (crop — видимая часть кадра). Мимо картинки — None."""
+    scale = min(tile_w / max(frame_w, 1), tile_h / max(frame_h, 1))
+    out_w = max(1, min(tile_w, int(frame_w * scale)))
+    out_h = max(1, min(tile_h, int(frame_h * scale)))
+    left = (tile_w - out_w) // 2
+    top = (tile_h - out_h) // 2
+    u = (px - left) / out_w
+    v = (py - top) / out_h
+    if not (0.0 <= u <= 1.0 and 0.0 <= v <= 1.0):
+        return None
+    x0, y0, x1, y1 = crop if crop is not None else (0, 0, frame_w, frame_h)
+    return x0 + u * (x1 - x0), y0 + v * (y1 - y0)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -143,6 +169,8 @@ class App(tk.Tk):
         self.photos: list[ImageTk.PhotoImage] = []
         self.trails: dict[str, list] = {}
         self.zoom_state: dict[str, dict[str, float]] = {}
+        # Ширина и высота показанного кадра и окна камеры: клик → пиксель кадра.
+        self._tile_geom: dict[str, tuple[int, int, int, int]] = {}
         self.auto_phone = True
         self._phone_wait_text = "Подключаю камеру телефона…"
         self._scan_running = False
@@ -158,8 +186,10 @@ class App(tk.Tk):
         # Сначала поле 3D справа, остаток ширины — камерам. Рост поля забирает этот остаток.
         self.scene.pack(side="right", anchor="n", padx=(0, 8), pady=8)
         self.cameras.pack(side="left", fill="both", expand=True, padx=(8, 4), pady=8)
+        # size_ne_sw есть только в Tk под Windows; на macOS и Linux — свой угловой курсор.
+        grip_cursor = "size_ne_sw" if sys.platform == "win32" else "bottom_left_corner"
         self._scene_grip = tk.Frame(
-            self.scene, width=16, height=16, bg="#5c6574", cursor="size_ne_sw"
+            self.scene, width=16, height=16, bg="#5c6574", cursor=grip_cursor
         )
         self._scene_grip.place(relx=0.0, rely=1.0, anchor="sw", width=16, height=16)
         self._scene_grip.bind("<ButtonPress-1>", self._scene_grip_press)
@@ -188,12 +218,15 @@ class App(tk.Tk):
         file_menu.add_command(label="Демо", command=self.use_demo)
         file_menu.add_command(label="Демо 3D", command=self.use_rig)
         file_menu.add_command(label="Путь 5 камер", command=self.use_way1)
+        file_menu.add_command(label="Открыть папку с роликами…", command=self.open_scene_folder)
         file_menu.add_command(label="Открыть видео…", command=self.open_video)
         file_menu.add_command(label="Добавить видео…", command=self.add_video)
         file_menu.add_command(label="URL потока…", command=self.open_url)
         file_menu.add_command(label="Сохранить контроль…", command=self.save_control)
         file_menu.add_command(label="Отчёт погрешности…", command=self.save_metrics)
+        file_menu.add_command(label="Сохранить путь выбранной машины…", command=self.save_vehicle_path)
         file_menu.add_command(label="Контрольный прогон Way1…", command=self.run_way1_control)
+        file_menu.add_command(label="Контрольный прогон папки…", command=self.run_folder_control)
         file_menu.add_separator()
         file_menu.add_command(label="Выход", command=self.destroy)
         menu.add_cascade(label="Файл", menu=file_menu)
@@ -212,6 +245,10 @@ class App(tk.Tk):
         target_menu.add_command(label="Красная машина", command=lambda: self.use_pattern("red_car"))
         target_menu.add_command(label="Грузовик (текст)", command=lambda: self.use_pattern("truck_text"))
         target_menu.add_command(label="Своя цель текстом…", command=self.edit_text_query)
+        target_menu.add_separator()
+        # Поток машин: Shift+клик по машине в окне камеры — следить за ней.
+        target_menu.add_command(label="Транспорт (Shift+клик — выбрать машину)", command=lambda: self.use_pattern("traffic"))
+        target_menu.add_command(label="Снять выбор машины", command=self.clear_vehicle)
         target_menu.add_separator()
         for horizon in (0.25, 0.5, 1.0):
             target_menu.add_command(
@@ -246,6 +283,8 @@ class App(tk.Tk):
             parts.append(f"Видео: {Path(video).name}")
         if info.get("csv") is not None:
             parts.append("xyz.csv")
+        if info.get("xlsx") is not None:
+            parts.append("Excel: xyz.xlsx")
         charts = info.get("charts") or []
         if charts:
             parts.append(f"графики: {len(charts)}")
@@ -261,8 +300,17 @@ class App(tk.Tk):
                 "Погрешность", "Нет точек 3D с номером кадра. Сначала прогон записи с XYZ."
             )
             return
+        scene = getattr(self, "scene_folder", None)
         try:
-            truth = load_truth_meters(ROOT)
+            if self.session.pose_tables and scene is not None:
+                # Открыта папка любой записи: эталон — её таблица пути цели.
+                from app.scene_folder import scene_truth
+
+                truth = scene_truth(scene)
+                if truth is None:
+                    raise ValueError("в папке нет таблицы пути цели")
+            else:
+                truth = load_truth_meters(ROOT)
         except Exception as error:
             messagebox.showerror("Погрешность", f"Эталон не прочитан: {error}")
             return
@@ -286,7 +334,7 @@ class App(tk.Tk):
             messagebox.showinfo("Контрольный прогон", "Прогон уже идёт.")
             return
         from app.cine_table import track_meters
-        from app.control_run import ControlConfig, run_control, way1_clips
+        from app.control_run import ControlConfig, way1_clips
         from app.vehicle import VehicleModel
 
         pattern = self.patterns.get("way1")
@@ -303,6 +351,51 @@ class App(tk.Tk):
         model = VehicleModel.from_config(pattern.vehicle)
         config = ControlConfig()
         config.fusion.range_m = (pattern.r_min, pattern.r_max)
+        self._launch_control(clips, model, config, truth, out_dir)
+
+    def run_folder_control(self) -> None:
+        """Контрольный прогон любой записи: ролики и таблицы поз с любыми именами, в фоне."""
+        if getattr(self, "_control_thread", None) is not None and self._control_thread.is_alive():
+            messagebox.showinfo("Контрольный прогон", "Прогон уже идёт.")
+            return
+        from app.control_run import ControlConfig, scene_clips
+        from app.scene_folder import describe, safe_name, scan_folder, scene_truth
+        from app.vehicle import VehicleModel
+
+        pattern = self.patterns.get("way1")
+        if pattern is None or not pattern.vehicle:
+            messagebox.showerror("Контрольный прогон", "В config.yaml у профиля way1 нет блока vehicle.")
+            return
+        opened = getattr(self, "scene_folder", None)
+        folder = filedialog.askdirectory(
+            title="Папка с роликами и таблицами поз",
+            initialdir=str(opened.root) if opened is not None else str(ROOT),
+        )
+        if not folder:
+            return
+        try:
+            scene = scan_folder(Path(folder))
+            clips = scene_clips(scene)
+        except Exception as error:
+            messagebox.showerror("Контрольный прогон папки", f"Папка не разобралась: {error}")
+            return
+        if len(clips) < 2:
+            messagebox.showerror(
+                "Контрольный прогон папки",
+                "Для 3D нужны минимум 2 ролика с таблицами поз.\n\n" + describe(scene),
+            )
+            return
+        config = ControlConfig()
+        config.fusion.range_m = (pattern.r_min, pattern.r_max)
+        out_dir = ROOT / "reports" / f"{safe_name(scene.root.name)}_control"
+        self.status.configure(text=describe(scene))
+        self._launch_control(clips, VehicleModel.from_config(pattern.vehicle), config, scene_truth(scene), out_dir)
+
+    def _launch_control(self, clips, model, config, truth, out_dir: Path) -> None:
+        """Контрольный прогон в фоновом потоке; итог — окном из _watch_control."""
+        from app.control_run import run_control
+
+        self._control_out = out_dir
         self._control_note = "Контрольный прогон: старт…"
         self._control_result = None
 
@@ -330,7 +423,7 @@ class App(tk.Tk):
         if isinstance(result, Exception):
             messagebox.showerror("Контрольный прогон", str(result))
             return
-        lines = [f"Папка: {ROOT / 'reports' / 'way1_control'}"]
+        lines = [f"Папка: {getattr(self, '_control_out', ROOT / 'reports' / 'way1_control')}"]
         if result is not None and result.stats:
             stats = result.stats
             lines += [
@@ -338,6 +431,8 @@ class App(tk.Tk):
                 f"RMSE {stats['rmse_m']:.3f} м, медиана {stats['median_m']:.3f} м",
                 f"95% кадров точнее {stats['p95_m']:.3f} м, максимум {stats['max_m']:.3f} м",
             ]
+        if result is not None and result.files.get("xlsx") is not None:
+            lines.append(f"Excel: {Path(result.files['xlsx']).name}")
         messagebox.showinfo("Контрольный прогон", "\n".join(lines))
 
     def open_phone(self) -> None:
@@ -384,6 +479,61 @@ class App(tk.Tk):
         self.status.configure(
             text=f"{len(sources)} камер. След 3D — только триангуляция по кадрам."
         )
+
+    def open_scene_folder(self) -> None:
+        """Ролики любой записи: все видео папки, таблицы поз по именам. Позы есть — 3D, нет — 2D."""
+        from app.scene_folder import describe, scan_folder, scene_poses, video_motion_px
+
+        folder = filedialog.askdirectory(title="Папка с роликами (и таблицами поз, если есть)")
+        if not folder:
+            return
+        try:
+            scene = scan_folder(Path(folder))
+        except Exception as error:
+            messagebox.showerror("Папка с роликами", f"Папка не разобралась: {error}")
+            return
+        if not scene.cameras:
+            messagebox.showerror("Папка с роликами", describe(scene))
+            return
+        sources = []
+        for camera in scene.cameras:
+            source = VideoSource(str(camera.video), camera.camera_id)
+            if source.is_open():
+                sources.append(source)
+            else:
+                source.close()
+        if not sources:
+            messagebox.showerror("Папка с роликами", "Ни один ролик не открылся.")
+            return
+        self.auto_phone = False
+        self.focus = None
+        tables = scene_poses(scene)
+        if len(tables) >= 2:
+            # Позы двух и более камер: цель — машина, 3D-ящик по рамкам, как Way1.
+            pattern = self.patterns.get("way1")
+            if pattern is not None:
+                pattern.predict_s = self.profile.predict_s
+                self.profile = pattern
+                self.session.set_profile(pattern)
+            poses = {camera_id: table(0) for camera_id, table in tables.items()}
+            self.session.set_sources(sources, poses)
+            moving = {camera.camera_id for camera in scene.cameras if camera.moving or camera.turning}
+            self.session.set_pose_tables(tables, moving)
+        else:
+            # Без поз — 2D. Картинка гуляет (камера в руке или едет) — детектор с компенсацией движения.
+            shaky = any(video_motion_px(camera.video) > 1.5 for camera in scene.cameras)
+            if shaky and not self.profile.moving_camera:
+                profile = dataclasses.replace(self.profile, moving_camera=True)
+                self.profile = profile
+                self.session.set_profile(profile)
+            self.session.set_sources(sources)
+        # Не self.scene: это холст поля 3D (SceneCanvas).
+        self.scene_folder = scene
+        self.trails.clear()
+        self.zoom_state.clear()
+        self.status.configure(text=describe(scene))
+        if any(word in note for note in scene.notes for word in ("проверьте", "не прочиталась", "не открылся")):
+            messagebox.showwarning("Папка с роликами", describe(scene))
 
     def open_video(self) -> None:
         path = filedialog.askopenfilename(
@@ -587,6 +737,12 @@ class App(tk.Tk):
     def _camera_popup(self, event: tk.Event, camera_id: str) -> None:
         """Правый клик по окну камеры: добавить другое видео или убрать это."""
         menu = tk.Menu(self, tearoff=0)
+        menu.add_command(
+            label="Следить за этой машиной",
+            command=lambda x=event.x, y=event.y: self.select_vehicle(camera_id, x, y),
+        )
+        menu.add_command(label="Снять выбор машины", command=self.clear_vehicle)
+        menu.add_separator()
         menu.add_command(label="Добавить видео…", command=self.add_video)
         menu.add_command(
             label="Удалить камеру",
@@ -596,6 +752,56 @@ class App(tk.Tk):
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
+    def select_vehicle(self, camera_id: str, px: float, py: float) -> None:
+        """Shift+клик по машине в окне камеры: следить за ней на всех камерах."""
+        if self.session.vehicle is not None and len(self.session.poses) >= 2:
+            self.status.configure(text="Режим 3D-ящика ведёт одну цель сам. Для выбора машины — «Цель → Транспорт».")
+            return
+        geom = self._tile_geom.get(camera_id)
+        if geom is None:
+            return
+        crop = self.zoom_state.get(camera_id, {}).get("crop")
+        point = tile_to_image(px, py, *geom, crop=crop)
+        if point is None or not self.session.select_target(camera_id, *point):
+            self.status.configure(text="Здесь машины нет — Shift+клик прямо по рамке машины.")
+            return
+        self.status.configure(text=f"Выбрана машина на {camera_id}: на других камерах она найдётся по геометрии.")
+
+    def clear_vehicle(self) -> None:
+        self.session.clear_target()
+        self.status.configure(text="Выбор машины снят.")
+
+    def save_vehicle_path(self) -> None:
+        """Путь выбранной машины (или главной цели) по кадрам: CSV и Excel."""
+        from app.excel_export import table_from_csv, write_workbook
+
+        marked = list(self.session.trail_frames)
+        if not marked:
+            messagebox.showwarning("Путь машины", "Пути 3D ещё нет: нужна машина, которую видят две камеры с позами.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Путь выбранной машины",
+            initialdir=str(ROOT / "reports"),
+            initialfile=f"path_target_{self.session.target_id}.csv",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+        )
+        if not path:
+            return
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rows = ["frame,x_m,y_m,z_m,step_m"]
+        previous = None
+        for frame, point in marked:
+            point = np.asarray(point, np.float64).reshape(3)
+            step = "" if previous is None else f"{np.linalg.norm(point - previous):.4f}"
+            rows.append(f"{frame},{point[0]:.4f},{point[1]:.4f},{point[2]:.4f},{step}")
+            previous = point
+        path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        book = write_workbook(path.with_suffix(".xlsx"), [table_from_csv("Путь машины", path)])
+        names = [path.name] + ([book.name] if book is not None else [])
+        messagebox.showinfo("Путь машины", f"Точек: {len(marked)}\n" + "\n".join(names))
 
     def remove_camera(self, camera_id: str) -> None:
         pipeline = next(
@@ -846,6 +1052,7 @@ class App(tk.Tk):
             self.cameras.grid_rowconfigure(index, weight=0)
         shown: set[str] = set()
         for index, (camera_id, image) in enumerate(tiles):
+            self._tile_geom[camera_id] = (image.shape[1], image.shape[0], tile_w, tile_h)
             image = fit_camera_tile(image, tile_w, tile_h)
             rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             photo = ImageTk.PhotoImage(Image.fromarray(rgb))
@@ -867,6 +1074,11 @@ class App(tk.Tk):
                 label.bind(
                     "<Button-3>",
                     lambda event, camera_id=camera_id: self._camera_popup(event, camera_id),
+                )
+                # Shift+клик по машине — следить за ней (обычный клик остаётся «только эта камера»).
+                label.bind(
+                    "<Shift-Button-1>",
+                    lambda event, camera_id=camera_id: self.select_vehicle(camera_id, event.x, event.y),
                 )
                 self.labels[camera_id] = label
             label.configure(image=photo)
@@ -941,13 +1153,21 @@ class App(tk.Tk):
                 1,
             )
         track = step.track
+        # Остальные машины — тонкие рамки: по ним Shift+клик выбирает цель.
+        for other in (step.tracks or [])[1:]:
+            if other.bbox is not None:
+                x, y, w, h = other.bbox
+                cv2.rectangle(image, (x, y), (x + w, y + h), (150, 150, 150), 1)
         if track.bbox is not None:
             x, y, w, h = track.bbox
             color = (80, 220, 80) if track.in_gate else (0, 200, 255)
-            cv2.rectangle(image, (x, y), (x + w, y + h), color, 2)
+            if step.selected:
+                color = (0, 230, 255)
+            cv2.rectangle(image, (x, y), (x + w, y + h), color, 4 if step.selected else 2)
             cv2.putText(
                 image,
-                str(self.session.target_id),
+                # cv2.putText не рисует кириллицу.
+                f"{self.session.target_id} TARGET" if step.selected else str(self.session.target_id),
                 (x, max(16, y - 6)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
@@ -1002,6 +1222,8 @@ class App(tk.Tk):
             advance_zoom(state, False, state["cx"], state["cy"], 0.0, float(width))
 
         zoom = state["zoom"]
+        # Видимая часть кадра — по ней клик в окне камеры переводится в пиксели кадра.
+        state["crop"] = (0, 0, width, height)
         if zoom <= 1.001:
             return image
 
@@ -1016,6 +1238,7 @@ class App(tk.Tk):
         crop = image[y0:y1, x0:x1]
         if crop.size == 0:
             return image
+        state["crop"] = (x0, y0, x1, y1)
         return cv2.resize(crop, (width, height), interpolation=cv2.INTER_LINEAR)
 
     def _draw_scene(self, tick) -> None:
@@ -1050,6 +1273,11 @@ class App(tk.Tk):
 
     def _draw_status(self, tick) -> None:
         parts = []
+        if self.session.selection_camera is not None:
+            following = self.session.selection_cameras()
+            parts.append(
+                f"выбрана машина {self.session.target_id}: ведут {', '.join(following) or 'нет — потеряна, жду её возвращения'}"
+            )
         for step in tick.steps:
             detection = step.detection
             track = step.track
@@ -1065,6 +1293,7 @@ class App(tk.Tk):
                 f"XYZ {world.xyz[0]:.2f} {world.xyz[1]:.2f} {world.xyz[2]:.2f} м   "
                 f"дальность {np.linalg.norm(world.xyz):.2f} м   "
                 f"{world.speed_m_s:.2f} м/с"
+                + (f"   ±{tick.sigma_m:.1f} м" if getattr(tick, "sigma_m", None) is not None else "")
             )
             focus = self.focus or (tick.steps[0].frame.camera_id if tick.steps else None)
             relative = world.relative.get(focus) if focus else None

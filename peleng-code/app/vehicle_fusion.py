@@ -32,6 +32,7 @@ from app.vehicle import (
     VehicleTracker,
     anchor_point,
     box_corners,
+    numeric_jacobian,
     predicted_sides,
     robust_update,
     state_from_center,
@@ -54,6 +55,9 @@ class FusionConfig:
     # σ старта: x, y, z, курс, тангаж, скорость, поворот.
     init_spread: tuple[float, ...] = (100.0, 100.0, 100.0, 3.2, 0.15, 10.0, 0.5)
     inside_share: float = 0.5       # пятно должно лежать в окне поиска хотя бы этой долей
+    # Одна камера задаёт направление на цель, но не дальность: скорость и поворот по такому
+    # измерению не учатся — остаются с последнего шага, где камер было не меньше двух.
+    hold_motion_single: bool = False
     miss_limit: int = 60            # столько шагов без измерений — трек закрыт
     range_m: tuple[float, float] = (1.0, 2000.0)
     support_iou: float = 0.5        # камера «подтверждает» ящик: силуэт совпал с проекцией
@@ -85,6 +89,16 @@ class VehicleView:
     heading_rad: float = 0.0
     observed: dict[str, tuple[float, float, float, float]] = field(default_factory=dict)
     rms_px: float | None = None
+    # Неопределённость опорной точки, м: σ по худшему направлению из ковариации фильтра.
+    # Мала — геометрия камер задаёт положение; велика — по одной камере дальность не измерена.
+    sigma_m: float | None = None
+
+
+def anchor_sigma(state: np.ndarray, covariance: np.ndarray, model: VehicleModel) -> float:
+    """σ опорной точки по худшему направлению: J·P·Jᵀ, J — якобиан опорной точки по состоянию."""
+    jacobian = numeric_jacobian(lambda candidate: anchor_point(candidate, model), state)
+    spread = jacobian @ covariance @ jacobian.T
+    return float(np.sqrt(max(float(np.linalg.eigvalsh(0.5 * (spread + spread.T)).max()), 0.0)))
 
 
 @dataclass
@@ -178,6 +192,8 @@ class VehicleFusion:
         self.tracker = self._new_tracker()
         self.segments: list[Segment] = []
         self.support = 0
+        # Скорость и поворот последнего шага, где цель видели две камеры и больше.
+        self._motion: tuple[float, float] | None = None
         self.reacquired = 0
         self._since_check = 0
         self.guide: dict | None = None
@@ -199,6 +215,8 @@ class VehicleFusion:
         self.tracker = self._new_tracker()
         self.segments = []
         self.support = 0
+        # Скорость и поворот последнего шага, где цель видели две камеры и больше.
+        self._motion: tuple[float, float] | None = None
         self.reacquired = 0
         self._since_check = 0
 
@@ -232,6 +250,10 @@ class VehicleFusion:
                     return self._start(time_s, views, key, found)
         result = tracker.step(time_s, observations)
         self.support = support
+        if result is not None and len(used) >= 2:
+            self._motion = (float(tracker.state[V]), float(tracker.state[OMEGA]))
+        elif result is not None and cfg.hold_motion_single and self._motion is not None:
+            tracker.state[V], tracker.state[OMEGA] = self._motion
         segment = self.segments[-1] if self.segments and self.segments[-1].tracker is tracker else None
         if segment is not None:
             segment.keys.append(key)
@@ -284,6 +306,8 @@ class VehicleFusion:
     def _view(self, fresh: bool, used: dict, rms: float | None) -> VehicleView:
         state = self.tracker.state
         assert state is not None
+        covariance = self.tracker.covariance
+        sigma = None if covariance is None else anchor_sigma(state, covariance, self.model)
         return VehicleView(
             active=True,
             fresh=fresh,
@@ -294,6 +318,7 @@ class VehicleFusion:
             heading_rad=float(state[PSI]),
             observed=used,
             rms_px=rms,
+            sigma_m=sigma,
         )
 
     def _associate(

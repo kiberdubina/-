@@ -1,3 +1,4 @@
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +34,10 @@ class _Clip:
     focal_mm: float
     sensor_w_mm: float
     sensor_h_mm: float
+    # Кадры таблицы, где поза была записана, и число строк, которые не разобрались.
+    first_frame: int = 0
+    last_frame: int = 0
+    bad_rows: int = 0
 
 
 def track_meters(root: Path) -> np.ndarray:
@@ -87,6 +92,137 @@ def _cached(root: Path, name: str, loader):
     return hit
 
 
+# ---------------------------------------------------------------- таблицы по пути
+# Ролики и таблицы любой записи: имя файла любое, кадр таблицы — абсолютный номер Frame.
+
+
+def _cached_path(path: Path, loader):
+    path = Path(path).resolve()
+    key = (str(path), f"{loader.__name__}:{path.stat().st_mtime_ns}")
+    hit = _CACHE.get(key)
+    if hit is None:
+        hit = loader(path)
+        _CACHE[key] = hit
+    return hit
+
+
+def camera_table(path: Path) -> _Clip:
+    """Таблица позы камеры (формат object_transform) по пути. Кадры 0..последний."""
+    return _cached_path(path, _read_camera)
+
+
+def track_table(path: Path) -> np.ndarray:
+    """Путь цели по пути таблицы, метры, индекс — номер кадра таблицы. shape (N, 3)."""
+    return np.array(_cached_path(path, _read_track), np.float64, copy=True)
+
+
+def pose_in_table(path: Path, frame: int, width: int, height: int, camera_id: str = "") -> CameraPose:
+    """Поза камеры на кадре таблицы. Вне диапазона — крайний кадр."""
+    clip = camera_table(path)
+    frame = _clamp(frame, int(clip.centers.shape[0]))
+    matrix = _intrinsics(clip.focal_mm, clip.sensor_w_mm, clip.sensor_h_mm, width, height)
+    return CameraPose(
+        camera_id=camera_id or Path(path).stem,
+        K=matrix,
+        dist=np.zeros(5, np.float64),
+        rvec=clip.rvecs[frame].reshape(3, 1).copy(),
+        tvec=clip.tvecs[frame].reshape(3, 1).copy(),
+        width=int(width),
+        height=int(height),
+    )
+
+
+def camera_motion(path: Path) -> tuple[float, float]:
+    """Насколько камера сдвигается и поворачивается за запись: метры и градусы от первого кадра."""
+    clip = camera_table(path)
+    start = clip.first_frame
+    centers = clip.centers[start:]
+    shift = float(np.linalg.norm(centers - centers[0], axis=1).max()) if len(centers) else 0.0
+    first, _ = cv2.Rodrigues(clip.rvecs[start].reshape(3, 1))
+    turn = 0.0
+    for rvec in clip.rvecs[start:]:
+        rotation, _ = cv2.Rodrigues(rvec.reshape(3, 1))
+        cosine = (float(np.trace(first.T @ rotation)) - 1.0) / 2.0
+        turn = max(turn, float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))))
+    return shift, turn
+
+
+def table_kind(path: Path) -> str | None:
+    """«camera» — поза камеры (есть углы), «track» — путь цели (только координаты), иначе None."""
+    try:
+        if _calibration_json(Path(path)) is not None:
+            return "camera"
+        lines = _lines(Path(path))
+    except Exception:
+        return None
+    if not lines:
+        return None
+    header = lines[0].lower()
+    if "loc" in header and "rot" in header:
+        return "camera"
+    if "loc" in header:
+        return "track"
+    # Таблица без шапки: по числу чисел в первой строке. Ровно 7 — поза, ровно 4 — путь;
+    # разметка MOT (10 чисел: кадр, id, рамка…) — ни то ни другое.
+    cells = [cell for cell in lines[0].split(_delimiter(lines[0])) if cell.strip()]
+    try:
+        [_number(cell) for cell in cells]
+    except ValueError:
+        return None
+    if len(cells) == 7:
+        return "camera"
+    if len(cells) == 4:
+        return "track"
+    return None
+
+
+def _calibration_json(path: Path) -> dict | None:
+    """Калибровка камеры CARLA (Synthehicle): JSON с intrinsic_matrix и extrinsic_matrix."""
+    if path.suffix.lower() not in (".txt", ".json") or path.stat().st_size > 100_000:
+        return None
+    text = path.read_text(encoding="utf-8", errors="replace").lstrip()
+    if not text.startswith("{"):
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    if "intrinsic_matrix" in data and "extrinsic_matrix" in data:
+        return data
+    return None
+
+
+def _read_calibration(data: dict) -> _Clip:
+    """Неподвижная камера CARLA. extrinsic — мир→камера в осях Unreal (вперёд, вправо, вверх),
+    метры. Мир программы — тот же Unreal со сменой знака Y (как у таблиц Way1), камера — OpenCV."""
+    K = np.asarray(data["intrinsic_matrix"], np.float64)
+    E = np.asarray(data["extrinsic_matrix"], np.float64)
+    flip = np.diag([1.0, -1.0, 1.0])
+    # Камера Unreal (вперёд, вправо, вверх) → OpenCV (вправо, вниз, вперёд).
+    to_cv = np.array([[0.0, 1.0, 0.0], [0.0, 0.0, -1.0], [1.0, 0.0, 0.0]])
+    rotation = to_cv @ E[:3, :3] @ flip
+    tvec = to_cv @ E[:3, 3]
+    rvec, _ = cv2.Rodrigues(rotation)
+    center = -rotation.T @ tvec
+    # Матрица K задана для кадра 2·cx × 2·cy: фокус в тех же единицах, что ширина матрицы.
+    return _Clip(
+        centers=center.reshape(1, 3),
+        rvecs=rvec.reshape(1, 3),
+        tvecs=tvec.reshape(1, 3),
+        focal_mm=float(K[0, 0]),
+        sensor_w_mm=float(2.0 * K[0, 2]),
+        sensor_h_mm=float(2.0 * K[1, 2]) * float(K[0, 0]) / float(K[1, 1]),
+    )
+
+
+def _delimiter(header: str) -> str:
+    if ";" in header:
+        return ";"
+    if "\t" in header:
+        return "\t"
+    return ","
+
+
 def _decode(path: Path) -> str:
     data = path.read_bytes()
     if data.startswith(b"\xef\xbb\xbf"):
@@ -98,12 +234,32 @@ def _decode(path: Path) -> str:
 
 
 def _lines(path: Path) -> list[str]:
+    if Path(path).suffix.lower() in (".xlsx", ".xlsm"):
+        return _excel_lines(Path(path))
     return [line.strip() for line in _decode(path).splitlines() if line.strip()]
+
+
+def _excel_lines(path: Path) -> list[str]:
+    """Первый лист книги Excel как строки CSV через «;». Ячейка-дата — битая, её заполнят соседи."""
+    from openpyxl import load_workbook
+
+    book = load_workbook(path, read_only=True, data_only=True)
+    try:
+        sheet = book.worksheets[0]
+        lines = []
+        for row in sheet.iter_rows(values_only=True):
+            cells = ["" if value is None else (repr(value) if isinstance(value, float) else str(value)) for value in row]
+            line = ";".join(cells).strip()
+            if line.strip(";"):
+                lines.append(line)
+        return lines
+    finally:
+        book.close()
 
 
 def _number(text: str) -> float:
     # В хвосте CSV десятичная запятая: «23,76».
-    cleaned = text.strip().replace(" ", "")
+    cleaned = text.strip().replace(" ", "").replace("\xa0", "")
     if "," in cleaned and "." not in cleaned:
         cleaned = cleaned.replace(",", ".")
     return float(cleaned)
@@ -130,7 +286,7 @@ def _fill_gaps(values: np.ndarray) -> np.ndarray:
 
 
 def _focal_mm(header: str) -> float:
-    cells = header.split(";")
+    cells = header.split(_delimiter(header))
     for index, cell in enumerate(cells):
         if cell.strip().lower() != "focal length":
             continue
@@ -146,22 +302,40 @@ def _sensor_mm(line: str) -> tuple[float, float]:
     return _number(match.group(1)), _number(match.group(2))
 
 
-def _by_frame(frames: list[int], values: np.ndarray) -> np.ndarray:
+def _by_frame(frames: list[int], values: np.ndarray, fill: float = 0.0) -> np.ndarray:
     count = max(frames) + 1
-    packed = np.zeros((count,) + values.shape[1:], np.float64)
+    packed = np.full((count,) + values.shape[1:], fill, np.float64)
     for index, frame in enumerate(frames):
         packed[frame] = values[index]
     return packed
 
 
+def _frame_number(text: str) -> int | None:
+    """Номер кадра из первой ячейки. Шапка или мусор — None."""
+    try:
+        value = float(text.strip().replace("\xa0", "").replace(",", "."))
+    except ValueError:
+        return None
+    if not np.isfinite(value) or value < 0:
+        return None
+    return int(round(value))
+
+
 def _read_track(path: Path) -> np.ndarray:
+    lines = _lines(path)
+    if not lines:
+        raise ValueError(f"{Path(path).name}: пустая таблица")
+    delimiter = _delimiter(lines[0])
     frames = []
     points = []
-    for line in _lines(path)[1:]:
-        cells = line.split(";")
+    for line in lines:
+        cells = line.split(delimiter)
         if len(cells) < 4:
             continue
-        frames.append(int(float(cells[0])))
+        frame = _frame_number(cells[0])
+        if frame is None:
+            continue
+        frames.append(frame)
         # Unreal: см, X вперёд, Y вправо, Z вверх → метры, Y со знаком минус.
         points.append(
             (
@@ -170,7 +344,10 @@ def _read_track(path: Path) -> np.ndarray:
                 _maybe_number(cells[3]) / 100.0,
             )
         )
-    return _fill_gaps(_by_frame(frames, np.asarray(points, np.float64)))
+    if not frames:
+        raise ValueError(f"{Path(path).name}: нет ни одной строки с кадром")
+    # Пропущенный кадр и битая ячейка — NaN, их заполняют соседние кадры.
+    return _fill_gaps(_by_frame(frames, np.asarray(points, np.float64), fill=np.nan))
 
 
 def _unreal_axes(roll_deg: float, pitch_deg: float, yaw_deg: float):
@@ -202,39 +379,75 @@ def _opencv_rotation(roll_deg: float, pitch_deg: float, yaw_deg: float) -> np.nd
 
 
 def _read_camera(path: Path) -> _Clip:
+    calibration = _calibration_json(Path(path))
+    if calibration is not None:
+        return _read_calibration(calibration)
     lines = _lines(path)
+    if not lines:
+        raise ValueError(f"{Path(path).name}: пустая таблица")
+    delimiter = _delimiter(lines[0])
     focal = _focal_mm(lines[0])
     sensor_w, sensor_h = _sensor_mm(lines[1]) if len(lines) > 1 else (_SENSOR_W_MM, _SENSOR_H_MM)
-    frames = []
-    centers = []
-    rvecs = []
-    tvecs = []
-    for line in lines[1:]:
-        cells = line.split(";")
-        if len(cells) < 7:
+    # Кадр → (центр в метрах, углы Unreal). Битая строка (Excel записал число датой) пропускается.
+    rows: dict[int, tuple[np.ndarray, tuple[float, float, float]]] = {}
+    bad = 0
+    for line in lines:
+        cells = line.split(delimiter)
+        frame = _frame_number(cells[0]) if cells else None
+        if frame is None:
             continue
-        frames.append(int(float(cells[0])))
-        center = np.array(
-            [
-                _number(cells[1]) / 100.0,
-                -_number(cells[2]) / 100.0,
-                _number(cells[3]) / 100.0,
-            ],
-            np.float64,
-        )
-        rotation = _opencv_rotation(_number(cells[4]), _number(cells[5]), _number(cells[6]))
-        rvec, _ = cv2.Rodrigues(rotation)
-        tvec = -rotation @ center
-        centers.append(center)
-        rvecs.append(rvec.reshape(3))
-        tvecs.append(tvec.reshape(3))
+        try:
+            if len(cells) < 7:
+                raise ValueError("мало ячеек")
+            center = np.array(
+                [
+                    _number(cells[1]) / 100.0,
+                    -_number(cells[2]) / 100.0,
+                    _number(cells[3]) / 100.0,
+                ],
+                np.float64,
+            )
+            angles = (_number(cells[4]), _number(cells[5]), _number(cells[6]))
+        except ValueError:
+            bad += 1
+            continue
+        if not (np.isfinite(center).all() and np.isfinite(angles).all()):
+            bad += 1
+            continue
+        rows[frame] = (center, angles)
+    if not rows:
+        raise ValueError(f"{Path(path).name}: нет ни одной строки позы")
+    known = np.array(sorted(rows), np.int64)
+    count = int(known[-1]) + 1
+    index = np.arange(count)
+    # Пропуск: центр — по соседним кадрам, поворот — ближайшего записанного кадра.
+    known_centers = np.stack([rows[int(frame)][0] for frame in known])
+    centers = np.stack([np.interp(index, known, known_centers[:, axis]) for axis in range(3)], axis=1)
+    after = np.clip(np.searchsorted(known, index), 0, len(known) - 1)
+    before = np.clip(after - 1, 0, len(known) - 1)
+    nearest = np.where(np.abs(known[before] - index) <= np.abs(known[after] - index), known[before], known[after])
+    rvecs = np.zeros((count, 3), np.float64)
+    tvecs = np.zeros((count, 3), np.float64)
+    cache: dict[tuple[float, float, float], tuple[np.ndarray, np.ndarray]] = {}
+    for frame in range(count):
+        angles = rows[int(nearest[frame])][1]
+        if angles not in cache:
+            rotation = _opencv_rotation(*angles)
+            rvec, _ = cv2.Rodrigues(rotation)
+            cache[angles] = (rotation, rvec.reshape(3))
+        rotation, rvec = cache[angles]
+        rvecs[frame] = rvec
+        tvecs[frame] = -rotation @ centers[frame]
     return _Clip(
-        centers=_by_frame(frames, np.asarray(centers, np.float64)),
-        rvecs=_by_frame(frames, np.asarray(rvecs, np.float64)),
-        tvecs=_by_frame(frames, np.asarray(tvecs, np.float64)),
+        centers=centers,
+        rvecs=rvecs,
+        tvecs=tvecs,
         focal_mm=float(focal),
         sensor_w_mm=float(sensor_w),
         sensor_h_mm=float(sensor_h),
+        first_frame=int(known[0]),
+        last_frame=int(known[-1]),
+        bad_rows=bad,
     )
 
 

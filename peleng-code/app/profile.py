@@ -141,11 +141,12 @@ def load_board(path: Path) -> BoardSpec:
 
 
 def save_active(path: Path, name: str, predict_s: float) -> None:
-    """Только активный профиль и горизонт. Строки правятся на месте: комментарии остаются."""
-    text = path.read_text(encoding="utf-8")
+    """Только активный профиль и горизонт. Строки правятся на месте: комментарии и переводы
+    строк файла (CRLF или LF) остаются."""
+    text = _read_raw(path)
     lines = {"active": name, "predict_s": predict_s}
     for key, value in lines.items():
-        pattern = re.compile(rf"^{key}:.*$", re.MULTILINE)
+        pattern = re.compile(rf"^{key}:[^\r\n]*", re.MULTILINE)
         if pattern.search(text) is None:
             data = load_document(path)
             data["active"] = name
@@ -153,7 +154,18 @@ def save_active(path: Path, name: str, predict_s: float) -> None:
             _dump(path, data)
             return
         text = pattern.sub(f"{key}: {value}", text, count=1)
-    path.write_text(text, encoding="utf-8")
+    _write_raw(path, text)
+
+
+def _read_raw(path: Path) -> str:
+    """Текст файла как есть, без замены \\r\\n на \\n."""
+    with open(path, encoding="utf-8", newline="") as handle:
+        return handle.read()
+
+
+def _write_raw(path: Path, text: str) -> None:
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        handle.write(text)
 
 
 def save_pattern(path: Path, name: str, fields: dict, predict_s: float) -> None:
@@ -203,7 +215,8 @@ def save_custom(path: Path, profile: TargetProfile, predict_s: float) -> None:
 
 
 def _dump(path: Path, data: dict) -> None:
-    path.write_text(
-        yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
-    )
+    text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+    # Файл в git с CRLF: перевод строк сохраняется, иначе diff на весь файл.
+    if path.is_file() and "\r\n" in _read_raw(path):
+        text = text.replace("\n", "\r\n")
+    _write_raw(path, text)
